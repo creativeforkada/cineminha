@@ -61,6 +61,44 @@ function broadcastParticipants(room) {
   broadcast(room, { type: 'participants_update', participants: getParticipantsList(room) });
 }
 
+// Envia o estado atual de "quem está pronto" pra todos os clientes da sala.
+// Cada cliente pode estar em um de três estados:
+//   • ready    — confirmou que está pronto pra assistir
+//   • blocked  — content script reportou que não consegue carregar o vídeo
+//                (ex: não logado, página errada, geoblock)
+//   • waiting  — padrão, ainda não respondeu
+// Se todos estiverem 'ready', manda também o all_ready que libera a playback.
+// O host pode forçar via 'force_ready'.
+function broadcastReadyState(room) {
+  const total = room.clients.size;
+  let ready = 0, waiting = 0, blocked = 0;
+  const readyList = [], blockedList = [], waitingList = [];
+  room.clients.forEach(({ name }, cid) => {
+    const st = room.readyStates.get(cid);
+    if (st?.state === 'ready') {
+      ready++;
+      readyList.push({ id: cid, name });
+    } else if (st?.state === 'blocked') {
+      blocked++;
+      blockedList.push({ id: cid, name, reason: st.reason || 'blocked', platform: st.platform || null });
+    } else {
+      waiting++;
+      waitingList.push({ id: cid, name });
+    }
+  });
+  broadcast(room, {
+    type: 'ready_state',
+    ready, waiting, blocked, total,
+    readyList, blockedList, waitingList,
+    version: room.contentVersion,
+  });
+  // Só dispara all_ready automaticamente se TODOS estão ready (bloqueados
+  // não contam — o host precisa forçar pra seguir sem eles).
+  if (total > 0 && ready === total && room.contentVersion > 0) {
+    broadcast(room, { type: 'all_ready', version: room.contentVersion });
+  }
+}
+
 // Durante host_navigate, o host troca de vídeo e os convidados são redirecionados.
 // Isso causa uma avalanche de disconnect/reconnect. Durante essa janela, suprimimos
 // os broadcasts de user_joined/user_left para manter o chat limpo — só atualizamos
@@ -136,6 +174,8 @@ wss.on('connection', (ws) => {
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
           contentUrl: sanitizeText(msg.contentUrl, 2000) || null,
+          contentVersion: 0,        // incrementa a cada mudança de conteúdo
+          readyStates: new Map(),   // clientId → { state, reason?, platform? }
           locked: false,
           mutedUsers: new Set(),
           polls: [],
@@ -163,6 +203,13 @@ wss.on('connection', (ws) => {
         currentRoomId = msg.roomId;
         room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() });
 
+        // Se a sala já tem conteúdo rolando, o novo participante entra como
+        // "pronto" automaticamente — não queremos que um late-joiner trave o
+        // grupo inteiro com o overlay de ready.
+        if (room.contentUrl && room.contentVersion > 0) {
+          room.readyStates.set(clientId, { state: 'ready' });
+        }
+
         sendTo(ws, {
           type: 'room_joined',
           roomId: msg.roomId,
@@ -173,6 +220,8 @@ wss.on('connection', (ws) => {
           polls: room.polls.filter(p => !p.ended),
           timestamps: room.timestamps,
           locked: room.locked,
+          contentUrl: room.contentUrl,
+          contentVersion: room.contentVersion,
         });
 
         if (isMigrating(room)) {
@@ -379,21 +428,6 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      // ─── COUNTDOWN (Modo Cinema) ────────────────────────
-      case 'countdown_start': {
-        const room = rooms.get(currentRoomId);
-        if (!room || room.hostId !== clientId) return;
-
-        // Apenas envia a contagem. O auto-play é tratado pelo content script
-        // do host ao receber seconds=0, evitando feedback loop.
-        [3, 2, 1, 0].forEach((sec, i) => {
-          setTimeout(() => {
-            broadcast(room, { type: 'countdown', seconds: sec });
-          }, i * 1100);
-        });
-        break;
-      }
-
       // ─── CONTROLES DO HOST ──────────────────────────────
       case 'kick_user': {
         const room = rooms.get(currentRoomId);
@@ -441,11 +475,63 @@ wss.on('connection', (ws) => {
         if (!room || room.hostId !== clientId) return;
         const newUrl = sanitizeText(msg.contentUrl, 2000);
         if (!newUrl) return;
+        if (newUrl === room.contentUrl) return; // no-op se é a mesma URL
         room.contentUrl = newUrl;
+        room.contentVersion++;
+        room.readyStates = new Map();
         // Abrir janela de migração: suprime user_joined/user_left enquanto os
         // convidados são redirecionados e recarregam seus content scripts.
         room.migrationUntil = Date.now() + MIGRATION_WINDOW_MS;
-        broadcast(room, { type: 'host_navigate', contentUrl: newUrl }, clientId);
+        broadcast(room, {
+          type: 'host_navigate',
+          contentUrl: newUrl,
+          contentVersion: room.contentVersion,
+        });
+        broadcastReadyState(room);
+        break;
+      }
+
+      // ─── READY UP (confirma que está pronto pro conteúdo atual) ─
+      case 'ready_up': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        if (typeof msg.version === 'number' && msg.version !== room.contentVersion) return;
+        const existing = room.readyStates.get(clientId);
+        if (existing?.state === 'ready') return;
+        room.readyStates.set(clientId, { state: 'ready' });
+        broadcastReadyState(room);
+        break;
+      }
+
+      // ─── BLOCKED (content script não consegue carregar o vídeo) ─
+      case 'blocked': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const existing = room.readyStates.get(clientId);
+        if (existing?.state === 'ready') return; // já pronto, ignora blocked stale
+        room.readyStates.set(clientId, {
+          state: 'blocked',
+          reason: sanitizeText(msg.reason, 100) || 'blocked',
+          platform: sanitizeText(msg.platform, 50) || null,
+        });
+        broadcastReadyState(room);
+        break;
+      }
+
+      // ─── FORCE READY (host decide seguir sem esperar todos) ──────
+      case 'force_ready': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        // Marca quem ainda não está pronto como ready (inclui blocked).
+        // Os convidados bloqueados continuam com o banner de "voltar ao
+        // conteúdo" até resolverem, mas não travam mais o grupo.
+        room.clients.forEach((_, cid) => {
+          const existing = room.readyStates.get(cid);
+          if (existing?.state !== 'ready') {
+            room.readyStates.set(cid, { state: 'ready', forced: true });
+          }
+        });
+        broadcastReadyState(room);
         break;
       }
 
@@ -457,56 +543,6 @@ wss.on('connection', (ws) => {
         if (!client) return;
         client.status = msg.status === 'away' ? 'away' : 'active';
         broadcastParticipants(room);
-        break;
-      }
-
-      // ─── SCREEN SHARE (WebRTC signaling) ────────────────
-      case 'screen_share_start': {
-        const room = rooms.get(currentRoomId);
-        if (!room || room.hostId !== clientId) return;
-        room.screenShare = true;
-        broadcast(room, { type: 'screen_share_started', hostId: clientId }, clientId);
-        break;
-      }
-
-      case 'screen_share_stop': {
-        const room = rooms.get(currentRoomId);
-        if (!room || room.hostId !== clientId) return;
-        room.screenShare = false;
-        broadcast(room, { type: 'screen_share_stopped' }, clientId);
-        break;
-      }
-
-      case 'rtc_ready': {
-        const room = rooms.get(currentRoomId);
-        if (!room) return;
-        // Encaminha para o host
-        const host = room.clients.get(room.hostId);
-        if (host) sendTo(host.ws, { type: 'rtc_ready', senderId: clientId });
-        break;
-      }
-
-      case 'rtc_offer': {
-        const room = rooms.get(currentRoomId);
-        if (!room) return;
-        const target = room.clients.get(msg.targetId);
-        if (target) sendTo(target.ws, { type: 'rtc_offer', senderId: clientId, sdp: msg.sdp });
-        break;
-      }
-
-      case 'rtc_answer': {
-        const room = rooms.get(currentRoomId);
-        if (!room) return;
-        const target = room.clients.get(msg.targetId);
-        if (target) sendTo(target.ws, { type: 'rtc_answer', senderId: clientId, sdp: msg.sdp });
-        break;
-      }
-
-      case 'rtc_ice': {
-        const room = rooms.get(currentRoomId);
-        if (!room) return;
-        const target = room.clients.get(msg.targetId);
-        if (target) sendTo(target.ws, { type: 'rtc_ice', senderId: clientId, candidate: msg.candidate });
         break;
       }
 
@@ -532,6 +568,7 @@ wss.on('connection', (ws) => {
 
     room.clients.delete(clientId);
     room.mutedUsers.delete(clientId);
+    room.readyStates.delete(clientId);
 
     if (room.hostId === clientId) {
       // HOST saiu → fechar sala para todos
@@ -554,6 +591,8 @@ wss.on('connection', (ws) => {
         name: clientName,
         participants: getParticipantsList(room),
       });
+      // Alguém saindo pode "desbloquear" o ready — re-envia o estado
+      broadcastReadyState(room);
     }
 
     currentRoomId = null;
