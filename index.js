@@ -59,13 +59,32 @@ function broadcastParticipants(room) {
   broadcast(room, { type: 'participants_update', participants: getParticipantsList(room) });
 }
 
-// ── Servidor HTTP (health check) ────────────────────────────
+// ── Servidor HTTP (health check + room info) ────────────────
 const server = http.createServer((req, res) => {
+  // CORS headers para permitir fetch do side panel
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+  // GET /room/:roomId — retorna URL do conteúdo para auto-redirect
+  const roomMatch = req.url.match(/^\/room\/([a-z0-9]{4,8})$/);
+  if (req.method === 'GET' && roomMatch) {
+    const room = rooms.get(roomMatch[1]);
+    if (!room) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Sala não encontrada.' }));
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ contentUrl: room.contentUrl || null }));
+    }
+    return;
+  }
+
+  // GET / — health check
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
     name: 'Cineminha Server',
     status: 'online',
-    version: '3.0.0',
+    version: '3.1.0',
     rooms: rooms.size,
     clients: Array.from(rooms.values()).reduce((a, r) => a + r.clients.size, 0),
   }));
@@ -105,6 +124,7 @@ wss.on('connection', (ws) => {
           clients: new Map([[clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() }]]),
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
+          contentUrl: sanitizeText(msg.contentUrl, 2000) || null,
           locked: false,
           mutedUsers: new Set(),
           polls: [],
@@ -405,6 +425,17 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      // ─── HOST NAVEGOU PARA OUTRO VÍDEO ──────────────────
+      case 'host_navigate': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        const newUrl = sanitizeText(msg.contentUrl, 2000);
+        if (!newUrl) return;
+        room.contentUrl = newUrl;
+        broadcast(room, { type: 'host_navigate', contentUrl: newUrl }, clientId);
+        break;
+      }
+
       // ─── PRESENÇA ───────────────────────────────────────
       case 'presence': {
         const room = rooms.get(currentRoomId);
@@ -439,20 +470,24 @@ wss.on('connection', (ws) => {
     room.clients.delete(clientId);
     room.mutedUsers.delete(clientId);
 
-    broadcast(room, {
-      type: 'user_left',
-      clientId,
-      name: clientName,
-      participants: getParticipantsList(room),
-    });
-
-    if (room.clients.size === 0) {
+    if (room.hostId === clientId) {
+      // HOST saiu → fechar sala para todos
+      broadcast(room, { type: 'room_closed', reason: 'O host encerrou a sala.' });
+      // Desconectar todos os clientes restantes
+      room.clients.forEach(({ ws: clientWs }) => {
+        try { clientWs.close(); } catch {}
+      });
+      rooms.delete(currentRoomId);
+    } else if (room.clients.size === 0) {
       room.emptyAt = Date.now();
-    } else if (room.hostId === clientId) {
-      const [newHostId, newHost] = room.clients.entries().next().value;
-      room.hostId = newHostId;
-      broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name });
-      sendTo(newHost.ws, { type: 'new_host', clientId: newHostId, name: newHost.name, isMe: true });
+    } else {
+      // Participante normal saiu — apenas notificar
+      broadcast(room, {
+        type: 'user_left',
+        clientId,
+        name: clientName,
+        participants: getParticipantsList(room),
+      });
     }
 
     currentRoomId = null;
