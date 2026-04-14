@@ -1,356 +1,434 @@
 // ============================================================
-// Cineminha - Servidor WebSocket (server/index.js)
-//
-// Este servidor gerencia as salas de assistir junto.
-// Ele NÃO transmite vídeo — apenas coordena quem faz o quê:
-// play, pause, seek, chat.
-//
-// Deploy gratuito no Render.com, Railway, Fly.io, etc.
+// Cineminha — Servidor WebSocket v3.0
+// Funcionalidades: sync, chat, reações, enquetes, timestamps,
+// countdown, presença, kick/mute/lock, host avançado
 // ============================================================
+'use strict';
 
+const http = require('http');
 const WebSocket = require('ws');
-const http      = require('http');
 const { v4: uuidv4 } = require('uuid');
 
 const PORT = process.env.PORT || 3000;
 
-// ── Servidor HTTP básico (necessário para o Render.com) ───────
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({
-    name:    'Cineminha Server',
-    status:  'online',
-    rooms:   rooms.size,
-    clients: Array.from(rooms.values()).reduce((acc, r) => acc + r.clients.size, 0),
-  }));
-});
-
-// ── Servidor WebSocket ────────────────────────────────────────
-const wss = new WebSocket.Server({ server });
-
-// ── Estrutura de dados das salas ──────────────────────────────
-// rooms: Map<roomId, RoomObject>
-// RoomObject: {
-//   id:        string,
-//   hostId:    string,
-//   clients:   Map<clientId, { ws, name }>,
-//   state:     { currentTime, playing, updatedAt }
-// }
+// ── Estrutura de dados ──────────────────────────────────────
 const rooms = new Map();
 
-// ============================================================
-//  UTILITÁRIOS
-// ============================================================
-
-// Gera um ID de sala curto e legível (8 caracteres alfanuméricos)
+// ── Utilitários ─────────────────────────────────────────────
 function generateRoomId() {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
   let id = '';
-  for (let i = 0; i < 8; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)];
-  }
-  // Garante unicidade
+  for (let i = 0; i < 8; i++) id += chars[Math.floor(Math.random() * chars.length)];
   return rooms.has(id) ? generateRoomId() : id;
 }
 
-// Envia uma mensagem para um único cliente
-function sendTo(ws, msg) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
+function sanitizeName(n) {
+  return String(n || '').trim().substring(0, 30) || 'Anônimo';
 }
 
-// Envia uma mensagem para todos os clientes de uma sala,
-// opcionalmente excluindo um (o remetente)
+function sanitizeText(t, max = 500) {
+  return String(t || '').trim().substring(0, max);
+}
+
+function sendTo(ws, msg) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
 function broadcast(room, msg, excludeId = null) {
   const data = JSON.stringify(msg);
-  room.clients.forEach(({ ws }, clientId) => {
-    if (clientId !== excludeId && ws.readyState === WebSocket.OPEN) {
-      ws.send(data);
-    }
+  room.clients.forEach(({ ws }, cid) => {
+    if (cid !== excludeId && ws.readyState === WebSocket.OPEN) ws.send(data);
   });
 }
 
-// Retorna a lista de participantes de uma sala
 function getParticipantsList(room) {
-  return Array.from(room.clients.entries()).map(([id, { name }]) => ({ id, name }));
-}
-
-// Limpa salas inativas (sem clientes há mais de 5 minutos)
-function cleanupRooms() {
-  const now = Date.now();
-  rooms.forEach((room, roomId) => {
-    if (room.clients.size === 0 && (now - room.createdAt > 300000)) {
-      rooms.delete(roomId);
-      console.log(`[Sala] Sala ${roomId} removida por inatividade`);
-    }
+  const list = [];
+  room.clients.forEach(({ name, status }, id) => {
+    list.push({
+      id,
+      name,
+      isHost: id === room.hostId,
+      status: status || 'active',
+      muted: room.mutedUsers.has(id),
+    });
   });
+  return list;
 }
-setInterval(cleanupRooms, 60000); // Verifica a cada minuto
 
-// ============================================================
-//  CONEXÕES
-// ============================================================
+function broadcastParticipants(room) {
+  broadcast(room, { type: 'participants_update', participants: getParticipantsList(room) });
+}
+
+// ── Servidor HTTP (health check) ────────────────────────────
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({
+    name: 'Cineminha Server',
+    status: 'online',
+    version: '3.0.0',
+    rooms: rooms.size,
+    clients: Array.from(rooms.values()).reduce((a, r) => a + r.clients.size, 0),
+  }));
+});
+
+// ── WebSocket ───────────────────────────────────────────────
+const wss = new WebSocket.Server({ server });
+
 wss.on('connection', (ws) => {
   const clientId = uuidv4();
   let currentRoomId = null;
-  let clientName    = 'Anônimo';
+  let clientName = 'Anônimo';
 
-  console.log(`[Cliente] Novo cliente conectado: ${clientId}`);
-
-  // ── Recebe mensagens do cliente ──────────────────────────
   ws.on('message', (rawData) => {
     let msg;
-    try {
-      msg = JSON.parse(rawData);
-    } catch {
-      sendTo(ws, { type: 'error', message: 'Mensagem inválida' });
-      return;
-    }
-
+    try { msg = JSON.parse(rawData); } catch { return; }
+    if (!msg || !msg.type) return;
     handleMessage(msg);
   });
 
-  // ── Trata desconexão ─────────────────────────────────────
-  ws.on('close', () => {
-    console.log(`[Cliente] Cliente desconectado: ${clientId} (sala: ${currentRoomId})`);
-    handleDisconnect();
-  });
+  ws.on('close', () => handleDisconnect());
+  ws.on('error', () => {});
 
-  ws.on('error', (err) => {
-    console.error(`[Cliente] Erro no cliente ${clientId}:`, err.message);
-  });
-
-  // ============================================================
-  //  ROTEADOR DE MENSAGENS
-  // ============================================================
+  // ── Roteador de mensagens ───────────────────────────────
   function handleMessage(msg) {
     switch (msg.type) {
 
-      // ─── CRIAR SALA ───────────────────────────────────────
+      // ─── CRIAR SALA ─────────────────────────────────────
       case 'create_room': {
-        if (currentRoomId) {
-          leaveCurrentRoom();
-        }
-
+        if (currentRoomId) leaveCurrentRoom();
         const roomId = generateRoomId();
-        clientName   = sanitizeName(msg.name);
+        clientName = sanitizeName(msg.name);
 
         rooms.set(roomId, {
-          id:        roomId,
-          hostId:    clientId,
-          clients:   new Map([[clientId, { ws, name: clientName }]]),
-          state:     { currentTime: 0, playing: false, updatedAt: Date.now() },
+          id: roomId,
+          hostId: clientId,
+          clients: new Map([[clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() }]]),
+          state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
+          locked: false,
+          mutedUsers: new Set(),
+          polls: [],
+          timestamps: [],
         });
 
         currentRoomId = roomId;
-
         sendTo(ws, {
-          type:     'room_created',
+          type: 'room_created',
           roomId,
           clientId,
-          participants: [{ id: clientId, name: clientName }],
+          participants: getParticipantsList(rooms.get(roomId)),
         });
-
-        console.log(`[Sala] Sala ${roomId} criada por "${clientName}" (${clientId})`);
         break;
       }
 
-      // ─── ENTRAR NA SALA ───────────────────────────────────
+      // ─── ENTRAR NA SALA ─────────────────────────────────
       case 'join_room': {
         const room = rooms.get(msg.roomId);
+        if (!room) { sendTo(ws, { type: 'error', message: 'Sala não encontrada. Verifique o código.' }); return; }
+        if (room.locked) { sendTo(ws, { type: 'error', message: 'Esta sala está trancada pelo host.' }); return; }
+        if (currentRoomId) leaveCurrentRoom();
 
-        if (!room) {
-          sendTo(ws, { type: 'error', message: `Sala "${msg.roomId}" não encontrada. Verifique o código.` });
-          return;
-        }
-
-        if (currentRoomId) {
-          leaveCurrentRoom();
-        }
-
-        // Se o cliente já estava na sala (reconexão), usa o mesmo clientId
-        const rejoiningId = msg.clientId && room.clients.has(msg.clientId) ? msg.clientId : clientId;
         clientName = sanitizeName(msg.name);
         currentRoomId = msg.roomId;
-
-        // Remove a entrada antiga se estiver reconectando
-        if (rejoiningId !== clientId) {
-          room.clients.delete(rejoiningId);
-        }
-
-        room.clients.set(clientId, { ws, name: clientName });
+        room.clients.set(clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() });
 
         sendTo(ws, {
-          type:         'room_joined',
-          roomId:       msg.roomId,
+          type: 'room_joined',
+          roomId: msg.roomId,
           clientId,
-          state:        room.state,
+          state: room.state,
           participants: getParticipantsList(room),
-          isHost:       room.hostId === clientId,
+          isHost: room.hostId === clientId,
+          polls: room.polls.filter(p => !p.ended),
+          timestamps: room.timestamps,
+          locked: room.locked,
         });
 
-        // Avisa os outros que alguém entrou
         broadcast(room, {
-          type:     'user_joined',
+          type: 'user_joined',
           clientId,
-          name:     clientName,
+          name: clientName,
+          participants: getParticipantsList(room),
         }, clientId);
-
-        console.log(`[Sala] "${clientName}" (${clientId}) entrou na sala ${msg.roomId}`);
         break;
       }
 
-      // ─── REJOIN COMO HOST (após reconexão) ───────────────
+      // ─── REJOIN HOST ────────────────────────────────────
       case 'rejoin_host': {
         const room = rooms.get(msg.roomId);
         if (!room) return;
-
         currentRoomId = msg.roomId;
         clientName = sanitizeName(msg.name);
-        room.clients.set(clientId, { ws, name: clientName });
-        room.hostId = clientId; // Reassume o host
+        room.clients.set(clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() });
+        room.hostId = clientId;
 
         sendTo(ws, {
-          type:     'room_joined',
-          roomId:   msg.roomId,
+          type: 'room_joined',
+          roomId: msg.roomId,
           clientId,
-          state:    room.state,
-          isHost:   true,
+          state: room.state,
+          isHost: true,
           participants: getParticipantsList(room),
+          polls: room.polls.filter(p => !p.ended),
+          timestamps: room.timestamps,
+          locked: room.locked,
         });
 
-        broadcast(room, {
-          type:   'new_host',
-          clientId,
-          name:   clientName,
-        }, clientId);
-
-        console.log(`[Sala] "${clientName}" reconectou como host em ${msg.roomId}`);
+        broadcast(room, { type: 'new_host', clientId, name: clientName }, clientId);
+        broadcastParticipants(room);
         break;
       }
 
-      // ─── SAIR DA SALA ─────────────────────────────────────
+      // ─── SAIR DA SALA ───────────────────────────────────
       case 'leave_room': {
         leaveCurrentRoom();
         break;
       }
 
-      // ─── PLAY ─────────────────────────────────────────────
+      // ─── PLAYBACK ───────────────────────────────────────
       case 'play': {
         const room = rooms.get(currentRoomId);
-        if (!room) return;
-        if (room.hostId !== clientId) {
-          sendTo(ws, { type: 'error', message: 'Apenas o host pode controlar a reprodução.' });
-          return;
-        }
-
+        if (!room || room.hostId !== clientId) return;
         room.state.currentTime = msg.currentTime || 0;
-        room.state.playing     = true;
-        room.state.updatedAt   = Date.now();
-
-        broadcast(room, {
-          type:        'play',
-          currentTime: msg.currentTime || 0,
-          timestamp:   Date.now(),
-        }, clientId);
-
-        console.log(`[Sala ${currentRoomId}] PLAY @ ${msg.currentTime?.toFixed(1)}s`);
+        room.state.playing = true;
+        room.state.updatedAt = Date.now();
+        broadcast(room, { type: 'play', currentTime: msg.currentTime || 0, timestamp: Date.now() }, clientId);
         break;
       }
 
-      // ─── PAUSE ────────────────────────────────────────────
       case 'pause': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
-
         room.state.currentTime = msg.currentTime || 0;
-        room.state.playing     = false;
-        room.state.updatedAt   = Date.now();
-
-        broadcast(room, {
-          type:        'pause',
-          currentTime: msg.currentTime || 0,
-        }, clientId);
-
-        console.log(`[Sala ${currentRoomId}] PAUSE @ ${msg.currentTime?.toFixed(1)}s`);
+        room.state.playing = false;
+        room.state.updatedAt = Date.now();
+        broadcast(room, { type: 'pause', currentTime: msg.currentTime || 0 }, clientId);
         break;
       }
 
-      // ─── SEEK ─────────────────────────────────────────────
       case 'seek': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
-
         room.state.currentTime = msg.currentTime || 0;
-        room.state.updatedAt   = Date.now();
-
-        broadcast(room, {
-          type:        'seek',
-          currentTime: msg.currentTime || 0,
-        }, clientId);
-
-        console.log(`[Sala ${currentRoomId}] SEEK → ${msg.currentTime?.toFixed(1)}s`);
+        room.state.updatedAt = Date.now();
+        broadcast(room, { type: 'seek', currentTime: msg.currentTime || 0 }, clientId);
         break;
       }
 
-      // ─── ESTADO DO HOST (para correção de drift) ──────────
       case 'host_state': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
-
         room.state.currentTime = msg.currentTime;
-        room.state.playing     = msg.playing;
-        room.state.updatedAt   = Date.now();
-
-        // Envia o estado para todos os participantes corrigirem drift
+        room.state.playing = msg.playing;
+        room.state.updatedAt = Date.now();
         broadcast(room, {
-          type:        'host_state',
+          type: 'host_state',
           currentTime: msg.currentTime,
-          playing:     msg.playing,
-          timestamp:   Date.now(),
+          playing: msg.playing,
+          timestamp: Date.now(),
         }, clientId);
         break;
       }
 
-      // ─── CHAT ─────────────────────────────────────────────
+      // ─── CHAT ───────────────────────────────────────────
       case 'chat': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
-
-        const text = sanitizeMessage(msg.message);
+        if (room.mutedUsers.has(clientId)) {
+          sendTo(ws, { type: 'error', message: 'Você está silenciado pelo host.' });
+          return;
+        }
+        const text = sanitizeText(msg.message);
         if (!text) return;
-
-        // Envia para TODOS (incluindo o remetente, assim ele confirma que foi enviado)
         broadcast(room, {
-          type:     'chat',
+          type: 'chat',
           clientId,
-          name:     clientName,
-          message:  text,
-          ts:       Date.now(),
+          name: clientName,
+          message: text,
+          ts: Date.now(),
         });
-
         break;
       }
 
-      // ─── PING (keepalive) ─────────────────────────────────
+      // ─── REAÇÕES ────────────────────────────────────────
+      case 'reaction': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const allowed = ['❤️', '😂', '😮', '😢', '🔥', '👏'];
+        if (!allowed.includes(msg.emoji)) return;
+        const reactionMsg = { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId };
+        broadcast(room, reactionMsg);
+        sendTo(ws, reactionMsg);
+        break;
+      }
+
+      // ─── ENQUETES ───────────────────────────────────────
+      case 'poll_create': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        const question = sanitizeText(msg.question, 150);
+        const options = (msg.options || []).slice(0, 4).map(o => sanitizeText(o, 80)).filter(Boolean);
+        if (!question || options.length < 2) return;
+
+        const poll = {
+          id: uuidv4().substring(0, 8),
+          question,
+          options,
+          votes: new Array(options.length).fill(0),
+          voters: {},
+          voterNames: {},
+          ended: false,
+          createdAt: Date.now(),
+        };
+        room.polls.push(poll);
+
+        const pollData = {
+          type: 'poll_created',
+          poll: { id: poll.id, question: poll.question, options: poll.options, votes: poll.votes, voterNames: poll.voterNames, ended: false },
+        };
+        broadcast(room, pollData);
+        sendTo(ws, pollData);
+        break;
+      }
+
+      case 'poll_vote': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const poll = room.polls.find(p => p.id === msg.pollId && !p.ended);
+        if (!poll) return;
+        const idx = msg.optionIndex;
+        if (idx < 0 || idx >= poll.options.length) return;
+        for (const voters of Object.values(poll.voters)) {
+          if (voters.includes(clientId)) return;
+        }
+        poll.votes[idx]++;
+        if (!poll.voters[idx]) poll.voters[idx] = [];
+        if (!poll.voterNames[idx]) poll.voterNames[idx] = [];
+        poll.voters[idx].push(clientId);
+        poll.voterNames[idx].push(clientName);
+
+        const updateMsg = { type: 'poll_updated', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames };
+        broadcast(room, updateMsg);
+        sendTo(ws, updateMsg);
+        break;
+      }
+
+      case 'poll_end': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        const poll = room.polls.find(p => p.id === msg.pollId && !p.ended);
+        if (!poll) return;
+        poll.ended = true;
+        const endMsg = { type: 'poll_ended', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames };
+        broadcast(room, endMsg);
+        sendTo(ws, endMsg);
+        break;
+      }
+
+      // ─── TIMESTAMPS ─────────────────────────────────────
+      case 'timestamp_mark': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const label = sanitizeText(msg.label, 100) || 'Momento marcado';
+        const time = parseFloat(msg.time) || 0;
+        const ts = {
+          id: uuidv4().substring(0, 8),
+          time,
+          label,
+          name: clientName,
+          createdAt: Date.now(),
+        };
+        room.timestamps.push(ts);
+        const tsMsg = { type: 'timestamp_marked', timestamp: ts };
+        broadcast(room, tsMsg);
+        sendTo(ws, tsMsg);
+        break;
+      }
+
+      // ─── COUNTDOWN (Modo Cinema) ────────────────────────
+      case 'countdown_start': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+
+        // Apenas envia a contagem. O auto-play é tratado pelo content script
+        // do host ao receber seconds=0, evitando feedback loop.
+        [3, 2, 1, 0].forEach((sec, i) => {
+          setTimeout(() => {
+            const cdMsg = { type: 'countdown', seconds: sec };
+            broadcast(room, cdMsg);
+            sendTo(ws, cdMsg);
+          }, i * 1100);
+        });
+        break;
+      }
+
+      // ─── CONTROLES DO HOST ──────────────────────────────
+      case 'kick_user': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        const tid = msg.targetId;
+        if (tid === clientId) return;
+        const target = room.clients.get(tid);
+        if (!target) return;
+        const targetName = target.name;
+        sendTo(target.ws, { type: 'kicked', message: 'Você foi removido da sala pelo host.' });
+        target.ws.close();
+        room.clients.delete(tid);
+        room.mutedUsers.delete(tid);
+        broadcast(room, { type: 'user_left', name: targetName, clientId: tid, kicked: true, participants: getParticipantsList(room) });
+        break;
+      }
+
+      case 'mute_user': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        const tid = msg.targetId;
+        if (tid === clientId) return;
+        const target = room.clients.get(tid);
+        if (!target) return;
+        const wasMuted = room.mutedUsers.has(tid);
+        if (wasMuted) room.mutedUsers.delete(tid); else room.mutedUsers.add(tid);
+        const muteMsg = { type: 'user_muted', targetId: tid, targetName: target.name, muted: !wasMuted };
+        broadcast(room, muteMsg);
+        sendTo(ws, muteMsg);
+        broadcastParticipants(room);
+        break;
+      }
+
+      case 'lock_room': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        room.locked = !room.locked;
+        const lockMsg = { type: 'room_locked', locked: room.locked };
+        broadcast(room, lockMsg);
+        sendTo(ws, lockMsg);
+        break;
+      }
+
+      // ─── PRESENÇA ───────────────────────────────────────
+      case 'presence': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const client = room.clients.get(clientId);
+        if (!client) return;
+        client.status = msg.status === 'away' ? 'away' : 'active';
+        broadcastParticipants(room);
+        break;
+      }
+
+      // ─── KEEPALIVE ──────────────────────────────────────
       case 'ping': {
         sendTo(ws, { type: 'pong' });
         break;
       }
 
-      default:
-        console.warn(`[Servidor] Tipo de mensagem desconhecido: "${msg.type}"`);
+      default: break;
     }
   }
 
-  // ============================================================
-  //  DESCONEXÃO / SAÍDA
-  // ============================================================
+  // ── Desconexão ──────────────────────────────────────────
   function handleDisconnect() {
-    if (!currentRoomId) return;
-    leaveCurrentRoom();
+    if (currentRoomId) leaveCurrentRoom();
   }
 
   function leaveCurrentRoom() {
@@ -359,57 +437,41 @@ wss.on('connection', (ws) => {
     if (!room) { currentRoomId = null; return; }
 
     room.clients.delete(clientId);
+    room.mutedUsers.delete(clientId);
 
-    // Avisa os outros que o participante saiu
     broadcast(room, {
-      type:     'user_left',
+      type: 'user_left',
       clientId,
-      name:     clientName,
+      name: clientName,
+      participants: getParticipantsList(room),
     });
 
-    console.log(`[Sala ${currentRoomId}] "${clientName}" saiu. Restam ${room.clients.size} clientes.`);
-
-    // Se a sala ficou vazia, não deleta imediatamente (aguarda cleanup)
     if (room.clients.size === 0) {
-      console.log(`[Sala ${currentRoomId}] Sala vazia, será removida em breve.`);
-    }
-    // Se o host saiu e ainda há outros, promove um novo host
-    else if (room.hostId === clientId) {
-      const newHostEntry = room.clients.entries().next().value;
-      if (newHostEntry) {
-        const [newHostId, { name: newHostName }] = newHostEntry;
-        room.hostId = newHostId;
-        console.log(`[Sala ${currentRoomId}] Novo host: "${newHostName}" (${newHostId})`);
-        broadcast(room, {
-          type:     'new_host',
-          clientId: newHostId,
-          name:     newHostName,
-        });
-      }
+      room.emptyAt = Date.now();
+    } else if (room.hostId === clientId) {
+      const [newHostId, newHost] = room.clients.entries().next().value;
+      room.hostId = newHostId;
+      broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name });
+      sendTo(newHost.ws, { type: 'new_host', clientId: newHostId, name: newHost.name, isMe: true });
     }
 
     currentRoomId = null;
   }
 });
 
-// ============================================================
-//  SANITIZAÇÃO DE DADOS
-// ============================================================
-function sanitizeName(name) {
-  if (!name || typeof name !== 'string') return 'Anônimo';
-  return name.trim().substring(0, 30) || 'Anônimo';
-}
+// ── Limpeza de salas inativas ────────────────────────────────
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room, id) => {
+    if (room.clients.size === 0 && room.emptyAt && now - room.emptyAt > 5 * 60 * 1000) {
+      rooms.delete(id);
+    }
+  });
+}, 60_000);
 
-function sanitizeMessage(msg) {
-  if (!msg || typeof msg !== 'string') return '';
-  return msg.trim().substring(0, 500);
-}
-
-// ============================================================
-//  START
-// ============================================================
+// ── Iniciar ─────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v3.0 rodando na porta ${PORT}`);
   console.log(`   Acesse: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
