@@ -276,9 +276,8 @@ wss.on('connection', (ws) => {
         if (!room) return;
         const allowed = ['❤️', '😂', '😮', '😢', '🔥', '👏'];
         if (!allowed.includes(msg.emoji)) return;
-        const reactionMsg = { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId };
-        broadcast(room, reactionMsg);
-        sendTo(ws, reactionMsg);
+        // Broadcast para todos (incluindo remetente) — sem sendTo extra
+        broadcast(room, { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId });
         break;
       }
 
@@ -307,7 +306,6 @@ wss.on('connection', (ws) => {
           poll: { id: poll.id, question: poll.question, options: poll.options, votes: poll.votes, voterNames: poll.voterNames, ended: false },
         };
         broadcast(room, pollData);
-        sendTo(ws, pollData);
         break;
       }
 
@@ -329,7 +327,6 @@ wss.on('connection', (ws) => {
 
         const updateMsg = { type: 'poll_updated', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames };
         broadcast(room, updateMsg);
-        sendTo(ws, updateMsg);
         break;
       }
 
@@ -341,7 +338,6 @@ wss.on('connection', (ws) => {
         poll.ended = true;
         const endMsg = { type: 'poll_ended', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames };
         broadcast(room, endMsg);
-        sendTo(ws, endMsg);
         break;
       }
 
@@ -361,7 +357,6 @@ wss.on('connection', (ws) => {
         room.timestamps.push(ts);
         const tsMsg = { type: 'timestamp_marked', timestamp: ts };
         broadcast(room, tsMsg);
-        sendTo(ws, tsMsg);
         break;
       }
 
@@ -374,9 +369,7 @@ wss.on('connection', (ws) => {
         // do host ao receber seconds=0, evitando feedback loop.
         [3, 2, 1, 0].forEach((sec, i) => {
           setTimeout(() => {
-            const cdMsg = { type: 'countdown', seconds: sec };
-            broadcast(room, cdMsg);
-            sendTo(ws, cdMsg);
+            broadcast(room, { type: 'countdown', seconds: sec });
           }, i * 1100);
         });
         break;
@@ -410,7 +403,6 @@ wss.on('connection', (ws) => {
         if (wasMuted) room.mutedUsers.delete(tid); else room.mutedUsers.add(tid);
         const muteMsg = { type: 'user_muted', targetId: tid, targetName: target.name, muted: !wasMuted };
         broadcast(room, muteMsg);
-        sendTo(ws, muteMsg);
         broadcastParticipants(room);
         break;
       }
@@ -421,7 +413,6 @@ wss.on('connection', (ws) => {
         room.locked = !room.locked;
         const lockMsg = { type: 'room_locked', locked: room.locked };
         broadcast(room, lockMsg);
-        sendTo(ws, lockMsg);
         break;
       }
 
