@@ -61,6 +61,15 @@ function broadcastParticipants(room) {
   broadcast(room, { type: 'participants_update', participants: getParticipantsList(room) });
 }
 
+// Durante host_navigate, o host troca de vídeo e os convidados são redirecionados.
+// Isso causa uma avalanche de disconnect/reconnect. Durante essa janela, suprimimos
+// os broadcasts de user_joined/user_left para manter o chat limpo — só atualizamos
+// a contagem de participantes via participants_update.
+const MIGRATION_WINDOW_MS = 20000;
+function isMigrating(room) {
+  return !!(room && room.migrationUntil && Date.now() < room.migrationUntil);
+}
+
 // ── Servidor HTTP (health check + room info) ────────────────
 const server = http.createServer((req, res) => {
   // CORS headers para permitir fetch do side panel
@@ -166,12 +175,17 @@ wss.on('connection', (ws) => {
           locked: room.locked,
         });
 
-        broadcast(room, {
-          type: 'user_joined',
-          clientId,
-          name: clientName,
-          participants: getParticipantsList(room),
-        }, clientId);
+        if (isMigrating(room)) {
+          // Dentro da janela de migração: apenas atualiza contagem, sem poluir o chat.
+          broadcastParticipants(room);
+        } else {
+          broadcast(room, {
+            type: 'user_joined',
+            clientId,
+            name: clientName,
+            participants: getParticipantsList(room),
+          }, clientId);
+        }
         break;
       }
 
@@ -428,6 +442,9 @@ wss.on('connection', (ws) => {
         const newUrl = sanitizeText(msg.contentUrl, 2000);
         if (!newUrl) return;
         room.contentUrl = newUrl;
+        // Abrir janela de migração: suprime user_joined/user_left enquanto os
+        // convidados são redirecionados e recarregam seus content scripts.
+        room.migrationUntil = Date.now() + MIGRATION_WINDOW_MS;
         broadcast(room, { type: 'host_navigate', contentUrl: newUrl }, clientId);
         break;
       }
@@ -526,6 +543,9 @@ wss.on('connection', (ws) => {
       rooms.delete(currentRoomId);
     } else if (room.clients.size === 0) {
       room.emptyAt = Date.now();
+    } else if (isMigrating(room)) {
+      // Durante migração por host_navigate, apenas ajusta contagem sem sys message.
+      broadcastParticipants(room);
     } else {
       // Participante normal saiu — apenas notificar
       broadcast(room, {
