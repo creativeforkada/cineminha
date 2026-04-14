@@ -43,10 +43,12 @@ function broadcast(room, msg, excludeId = null) {
 
 function getParticipantsList(room) {
   const list = [];
-  room.clients.forEach(({ name, status }, id) => {
+  room.clients.forEach(({ name, status, avatar, nameColor }, id) => {
     list.push({
       id,
       name,
+      avatar: avatar || '😎',
+      nameColor: nameColor || '#f0f0f5',
       isHost: id === room.hostId,
       status: status || 'active',
       muted: room.mutedUsers.has(id),
@@ -121,7 +123,7 @@ wss.on('connection', (ws) => {
         rooms.set(roomId, {
           id: roomId,
           hostId: clientId,
-          clients: new Map([[clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() }]]),
+          clients: new Map([[clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() }]]),
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
           contentUrl: sanitizeText(msg.contentUrl, 2000) || null,
@@ -150,7 +152,7 @@ wss.on('connection', (ws) => {
 
         clientName = sanitizeName(msg.name);
         currentRoomId = msg.roomId;
-        room.clients.set(clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() });
+        room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() });
 
         sendTo(ws, {
           type: 'room_joined',
@@ -179,7 +181,7 @@ wss.on('connection', (ws) => {
         if (!room) return;
         currentRoomId = msg.roomId;
         clientName = sanitizeName(msg.name);
-        room.clients.set(clientId, { ws, name: clientName, status: 'active', joinedAt: Date.now() });
+        room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() });
         room.hostId = clientId;
 
         sendTo(ws, {
@@ -260,10 +262,13 @@ wss.on('connection', (ws) => {
         }
         const text = sanitizeText(msg.message);
         if (!text) return;
+        const sender = room.clients.get(clientId);
         broadcast(room, {
           type: 'chat',
           clientId,
           name: clientName,
+          avatar: sender?.avatar || '😎',
+          nameColor: sender?.nameColor || '#f0f0f5',
           message: text,
           ts: Date.now(),
         });
@@ -435,6 +440,56 @@ wss.on('connection', (ws) => {
         if (!client) return;
         client.status = msg.status === 'away' ? 'away' : 'active';
         broadcastParticipants(room);
+        break;
+      }
+
+      // ─── SCREEN SHARE (WebRTC signaling) ────────────────
+      case 'screen_share_start': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        room.screenShare = true;
+        broadcast(room, { type: 'screen_share_started', hostId: clientId }, clientId);
+        break;
+      }
+
+      case 'screen_share_stop': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        room.screenShare = false;
+        broadcast(room, { type: 'screen_share_stopped' }, clientId);
+        break;
+      }
+
+      case 'rtc_ready': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        // Encaminha para o host
+        const host = room.clients.get(room.hostId);
+        if (host) sendTo(host.ws, { type: 'rtc_ready', senderId: clientId });
+        break;
+      }
+
+      case 'rtc_offer': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const target = room.clients.get(msg.targetId);
+        if (target) sendTo(target.ws, { type: 'rtc_offer', senderId: clientId, sdp: msg.sdp });
+        break;
+      }
+
+      case 'rtc_answer': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const target = room.clients.get(msg.targetId);
+        if (target) sendTo(target.ws, { type: 'rtc_answer', senderId: clientId, sdp: msg.sdp });
+        break;
+      }
+
+      case 'rtc_ice': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const target = room.clients.get(msg.targetId);
+        if (target) sendTo(target.ws, { type: 'rtc_ice', senderId: clientId, candidate: msg.candidate });
         break;
       }
 
