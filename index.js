@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v0.6.0-beta
+// Cineminha — Servidor WebSocket v0.11.0-beta
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -185,6 +185,7 @@ wss.on('connection', (ws, req) => {
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
           contentUrl: initialUrl,
+          contentTitle: null, // 🆕 v0.11 — título do vídeo extraído do <title> da página
           platform: initialPlatform, // 🆕 v0.5: trava da plataforma
           locked: false, mutedUsers: new Set(), polls: [],
           readiness: new Map(),
@@ -215,6 +216,7 @@ wss.on('connection', (ws, req) => {
           polls: room.polls.filter(p => !p.ended),
           locked: room.locked,
           contentUrl: room.contentUrl,
+          contentTitle: room.contentTitle || null,
           platform: room.platform,
           notReady: getReadinessList(room),
         });
@@ -252,6 +254,7 @@ wss.on('connection', (ws, req) => {
           polls: room.polls.filter(p => !p.ended),
           locked: room.locked,
           contentUrl: room.contentUrl,
+          contentTitle: room.contentTitle || null,
           platform: room.platform,
           notReady: getReadinessList(room),
         });
@@ -477,6 +480,18 @@ wss.on('connection', (ws, req) => {
         broadcastParticipants(room);
         break;
       }
+      // 🆕 v0.11 — Título do vídeo (só host pode setar). Faz broadcast pros guests.
+      case 'content_title': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        if (room.hostId !== clientId) return; // só host pode setar
+        const title = sanitizeText(msg.title, 200);
+        if (!title) return;
+        if (room.contentTitle === title) return; // sem mudança, não rebroadcast
+        room.contentTitle = title;
+        broadcast(room, { type: 'content_title', title, platform: sanitizeText(msg.platform, 40) || null });
+        break;
+      }
       case 'ping': { sendTo(ws, { type: 'pong' }); break; }
       default: break;
     }
@@ -549,7 +564,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v0.6.0-beta rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v0.11.0-beta rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
