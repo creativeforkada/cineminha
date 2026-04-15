@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v0.4.3-beta
+// Cineminha — Servidor WebSocket v0.5.0-beta
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -32,6 +32,24 @@ function generateHostToken() { return crypto.randomBytes(16).toString('hex'); }
 function sanitizeName(n) { return String(n || '').trim().substring(0, 30) || 'Anônimo'; }
 function sanitizeText(t, max = 500) { return String(t || '').trim().substring(0, max); }
 function sanitizeColor(c) { return /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#f0f0f5'; }
+
+// 🆕 v0.5: Sala pertence a uma plataforma. Identifica plataforma da URL.
+const PLATFORM_PATTERNS = [
+  { name: 'youtube',    re: /^https?:\/\/(www\.|m\.)?youtube\.com\/|^https?:\/\/youtu\.be\// },
+  { name: 'netflix',    re: /^https?:\/\/(www\.)?netflix\.com\// },
+  { name: 'disneyplus', re: /^https?:\/\/(www\.)?disneyplus\.com\// },
+  { name: 'primevideo', re: /^https?:\/\/(www\.)?primevideo\.com\// },
+  { name: 'max',        re: /^https?:\/\/(play\.|www\.)?(max|hbomax)\.com\// },
+  { name: 'globoplay',  re: /^https?:\/\/globoplay\.globo\.com\// },
+  { name: 'crunchyroll',re: /^https?:\/\/(www\.|beta\.)?crunchyroll\.com\// },
+];
+function detectPlatform(url) {
+  if (!url) return null;
+  for (const p of PLATFORM_PATTERNS) {
+    if (p.re.test(url)) return p.name;
+  }
+  return null;
+}
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return xff.split(',')[0].trim();
@@ -66,14 +84,12 @@ function broadcastParticipants(room) {
 function getReadinessList(room) {
   const notReady = [];
   room.clients.forEach((client, id) => {
-    // O host controla o vídeo, nunca aparece como "não pronto"
     if (id === room.hostId) return;
     const r = room.readiness.get(id);
     if (!r || r.status === 'ready') return;
     notReady.push({
       id, name: client.name,
       status: r.status, reason: r.reason || null,
-      adSeconds: r.adSeconds || null,
       since: r.since,
     });
   });
@@ -161,12 +177,15 @@ wss.on('connection', (ws, req) => {
         const roomId = generateRoomId();
         const hostToken = generateHostToken();
         clientName = sanitizeName(msg.name);
+        const initialUrl = sanitizeText(msg.contentUrl, 500) || null;
+        const initialPlatform = detectPlatform(initialUrl);
         rooms.set(roomId, {
           id: roomId, hostId: clientId, hostToken,
           clients: new Map([[clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() }]]),
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
-          contentUrl: sanitizeText(msg.contentUrl, 500) || null,
+          contentUrl: initialUrl,
+          platform: initialPlatform, // 🆕 v0.5: trava da plataforma
           locked: false, mutedUsers: new Set(), polls: [],
           readiness: new Map(),
           hostOrphanedAt: null, hostOrphanTimer: null,
@@ -175,6 +194,7 @@ wss.on('connection', (ws, req) => {
         sendTo(ws, {
           type: 'room_created',
           roomId, clientId, hostToken,
+          platform: initialPlatform,
           participants: getParticipantsList(rooms.get(roomId)),
         });
         break;
@@ -195,6 +215,7 @@ wss.on('connection', (ws, req) => {
           polls: room.polls.filter(p => !p.ended),
           locked: room.locked,
           contentUrl: room.contentUrl,
+          platform: room.platform,
           notReady: getReadinessList(room),
         });
         if (isMigrating(room)) {
@@ -231,6 +252,7 @@ wss.on('connection', (ws, req) => {
           polls: room.polls.filter(p => !p.ended),
           locked: room.locked,
           contentUrl: room.contentUrl,
+          platform: room.platform,
           notReady: getReadinessList(room),
         });
         broadcast(room, { type: 'new_host', clientId, name: clientName }, clientId);
@@ -238,6 +260,16 @@ wss.on('connection', (ws, req) => {
         break;
       }
       case 'leave_room': { leaveCurrentRoom(); break; }
+      case 'close_room': {
+        // 🆕 v0.5: host fechou aba do vídeo — encerra sala para todos
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        broadcast(room, { type: 'room_closed', reason: msg.reason || 'Host encerrou a sala.' });
+        if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
+        rooms.delete(currentRoomId);
+        currentRoomId = null;
+        break;
+      }
       case 'play': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
@@ -391,6 +423,26 @@ wss.on('connection', (ws, req) => {
         const newUrl = sanitizeText(msg.contentUrl, 500);
         if (!newUrl) return;
         if (newUrl === room.contentUrl) return;
+        const newPlatform = detectPlatform(newUrl);
+        if (!newPlatform) {
+          sendTo(ws, { type: 'error', message: 'URL não é de uma plataforma suportada.' });
+          return;
+        }
+        // 🆕 v0.5: Se a sala ainda não tem plataforma definida, define agora.
+        // Se já tem, REJEITA mudança para outra plataforma.
+        if (room.platform && room.platform !== newPlatform) {
+          sendTo(ws, {
+            type: 'platform_mismatch',
+            currentPlatform: room.platform,
+            newPlatform,
+            attemptedUrl: newUrl,
+          });
+          return;
+        }
+        if (!room.platform) {
+          room.platform = newPlatform;
+          broadcast(room, { type: 'platform_set', platform: newPlatform });
+        }
         room.contentUrl = newUrl;
         room.state.currentTime = 0;
         room.state.playing = false;
@@ -401,32 +453,17 @@ wss.on('connection', (ws, req) => {
         broadcastReadiness(room);
         break;
       }
-      case 'force_clear_ad': {
-        // Host força limpeza dos status 'ad' — escape hatch para falso positivo
-        const room = rooms.get(currentRoomId);
-        if (!room || room.hostId !== clientId) return;
-        let changed = false;
-        room.readiness.forEach((r, cid) => {
-          if (r.status === 'ad') {
-            room.readiness.delete(cid);
-            changed = true;
-          }
-        });
-        if (changed) broadcastReadiness(room);
-        break;
-      }
       case 'readiness': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
-        const validStatuses = ['ready', 'ad', 'blocked', 'buffering'];
+        // 🆕 v0.5: removido 'ad' — guests em ad não bloqueiam mais a sala
+        const validStatuses = ['ready', 'blocked', 'buffering'];
         if (!validStatuses.includes(msg.status)) return;
         const prev = room.readiness.get(clientId);
         const reason = typeof msg.reason === 'string' ? msg.reason.substring(0, 40) : null;
-        const adSeconds = (typeof msg.adSeconds === 'number' && msg.adSeconds >= 0 && msg.adSeconds < 600)
-          ? Math.round(msg.adSeconds) : null;
-        const next = { status: msg.status, reason, adSeconds, since: Date.now() };
+        const next = { status: msg.status, reason, since: Date.now() };
         room.readiness.set(clientId, next);
-        if (!prev || prev.status !== next.status || prev.reason !== next.reason || prev.adSeconds !== next.adSeconds) {
+        if (!prev || prev.status !== next.status || prev.reason !== next.reason) {
           broadcastReadiness(room);
         }
         break;
@@ -501,32 +538,18 @@ wss.on('connection', (ws, req) => {
   }
 });
 
-// Failsafe: limpa readiness 'ad' que ficou parado >120s.
-// Cobre o caso raro do detector de ad ficar preso em true.
-const AD_READINESS_MAX_MS = 120_000;
-
 setInterval(() => {
   const now = Date.now();
   rooms.forEach((room, id) => {
     if (room.clients.size === 0 && room.emptyAt && now - room.emptyAt > 5 * 60 * 1000) {
       if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
       rooms.delete(id);
-      return;
     }
-    // Expira readiness 'ad' antigo
-    let changed = false;
-    room.readiness.forEach((r, cid) => {
-      if (r.status === 'ad' && (now - r.since) > AD_READINESS_MAX_MS) {
-        room.readiness.delete(cid);
-        changed = true;
-      }
-    });
-    if (changed) broadcastReadiness(room);
   });
-}, 30_000);
+}, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v0.4.3-beta rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v0.5.0-beta rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
