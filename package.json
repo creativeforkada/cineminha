@@ -1,6 +1,6 @@
 {
   "name": "cineminha-server",
-  "version": "4.2.0",
+  "version": "0.4.2",
   "description": "Servidor WebSocket para o Cineminha - sincronização de streaming entre amigos",
   "main": "index.js",
   "scripts": {
