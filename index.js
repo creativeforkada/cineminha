@@ -1,5 +1,7 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v4.1
+// Cineminha — Servidor WebSocket v4.2.0
+// Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
+// estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
 // ============================================================
 'use strict';
@@ -66,7 +68,12 @@ function getReadinessList(room) {
   room.clients.forEach((client, id) => {
     const r = room.readiness.get(id);
     if (!r || r.status === 'ready') return;
-    notReady.push({ id, name: client.name, status: r.status, reason: r.reason || null, since: r.since });
+    notReady.push({
+      id, name: client.name,
+      status: r.status, reason: r.reason || null,
+      adSeconds: r.adSeconds || null,
+      since: r.since,
+    });
   });
   return notReady;
 }
@@ -94,7 +101,7 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    name: 'Cineminha Server', status: 'online', version: '4.1.0',
+    name: 'Cineminha Server', status: 'online', version: '4.2.0',
     rooms: rooms.size,
     clients: Array.from(rooms.values()).reduce((a, r) => a + r.clients.size, 0),
   }));
@@ -399,9 +406,11 @@ wss.on('connection', (ws, req) => {
         if (!validStatuses.includes(msg.status)) return;
         const prev = room.readiness.get(clientId);
         const reason = typeof msg.reason === 'string' ? msg.reason.substring(0, 40) : null;
-        const next = { status: msg.status, reason, since: Date.now() };
+        const adSeconds = (typeof msg.adSeconds === 'number' && msg.adSeconds >= 0 && msg.adSeconds < 600)
+          ? Math.round(msg.adSeconds) : null;
+        const next = { status: msg.status, reason, adSeconds, since: Date.now() };
         room.readiness.set(clientId, next);
-        if (!prev || prev.status !== next.status || prev.reason !== next.reason) {
+        if (!prev || prev.status !== next.status || prev.reason !== next.reason || prev.adSeconds !== next.adSeconds) {
           broadcastReadiness(room);
         }
         break;
@@ -487,7 +496,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v4.1 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v4.2 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
