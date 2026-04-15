@@ -29,6 +29,7 @@ function generateRoomId() {
 function generateHostToken() { return crypto.randomBytes(16).toString('hex'); }
 function sanitizeName(n) { return String(n || '').trim().substring(0, 30) || 'Anônimo'; }
 function sanitizeText(t, max = 500) { return String(t || '').trim().substring(0, max); }
+function sanitizeColor(c) { return /^#[0-9a-fA-F]{3,8}$/.test(c) ? c : '#f0f0f5'; }
 function getClientIp(req) {
   const xff = req.headers['x-forwarded-for'];
   if (xff) return xff.split(',')[0].trim();
@@ -153,7 +154,7 @@ wss.on('connection', (ws, req) => {
         clientName = sanitizeName(msg.name);
         rooms.set(roomId, {
           id: roomId, hostId: clientId, hostToken,
-          clients: new Map([[clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() }]]),
+          clients: new Map([[clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() }]]),
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
           contentUrl: sanitizeText(msg.contentUrl, 500) || null,
@@ -176,7 +177,7 @@ wss.on('connection', (ws, req) => {
         if (currentRoomId) leaveCurrentRoom();
         clientName = sanitizeName(msg.name);
         currentRoomId = msg.roomId;
-        room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() });
+        room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() });
         sendTo(ws, {
           type: 'room_joined', roomId: msg.roomId, clientId,
           state: room.state,
@@ -211,7 +212,7 @@ wss.on('connection', (ws, req) => {
         }
         currentRoomId = msg.roomId;
         clientName = sanitizeName(msg.name);
-        room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: msg.nameColor || '#f0f0f5', status: 'active', joinedAt: Date.now() });
+        room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() });
         room.hostId = clientId;
         sendTo(ws, {
           type: 'room_joined', roomId: msg.roomId, clientId,
@@ -257,10 +258,12 @@ wss.on('connection', (ws, req) => {
       case 'host_state': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
-        room.state.currentTime = msg.currentTime;
-        room.state.playing = msg.playing;
+        const hostTime = typeof msg.currentTime === 'number' ? msg.currentTime : room.state.currentTime;
+        const hostPlaying = typeof msg.playing === 'boolean' ? msg.playing : room.state.playing;
+        room.state.currentTime = hostTime;
+        room.state.playing = hostPlaying;
         room.state.updatedAt = Date.now();
-        broadcast(room, { type: 'host_state', currentTime: msg.currentTime, playing: msg.playing, timestamp: Date.now() }, clientId);
+        broadcast(room, { type: 'host_state', currentTime: hostTime, playing: hostPlaying, timestamp: Date.now() }, clientId);
         break;
       }
       case 'chat': {
@@ -314,14 +317,14 @@ wss.on('connection', (ws, req) => {
         if (!room) return;
         const poll = room.polls.find(p => p.id === msg.pollId && !p.ended);
         if (!poll) return;
-        const idx = msg.optionIndex;
-        if (idx < 0 || idx >= poll.options.length) return;
+        const idx = Number(msg.optionIndex);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= poll.options.length) return;
         for (const voters of Object.values(poll.voters)) {
-          if (voters.includes(clientId)) return;
+          if (Array.isArray(voters) && voters.includes(clientId)) return;
         }
-        poll.votes[idx]++;
-        if (!poll.voters[idx]) poll.voters[idx] = [];
-        if (!poll.voterNames[idx]) poll.voterNames[idx] = [];
+        poll.votes[idx] = (poll.votes[idx] || 0) + 1;
+        if (!Array.isArray(poll.voters[idx])) poll.voters[idx] = [];
+        if (!Array.isArray(poll.voterNames[idx])) poll.voterNames[idx] = [];
         poll.voters[idx].push(clientId);
         poll.voterNames[idx].push(clientName);
         broadcast(room, { type: 'poll_updated', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames });
@@ -448,13 +451,16 @@ wss.on('connection', (ws, req) => {
           room.hostToken = generateHostToken();
           room.hostOrphanedAt = null;
           room.hostOrphanTimer = null;
+          room.readiness.delete(newHostId);
           sendTo(newHost.ws, { type: 'host_promoted', hostToken: room.hostToken });
           broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name });
           broadcastParticipants(room);
+          broadcastReadiness(room);
         }, HOST_ORPHAN_GRACE_MS);
         broadcast(room, { type: 'host_orphaned', graceMs: HOST_ORPHAN_GRACE_MS });
       }
     } else if (room.clients.size === 0) {
+      if (room.hostOrphanTimer) { clearTimeout(room.hostOrphanTimer); room.hostOrphanTimer = null; }
       room.emptyAt = Date.now();
     } else if (isMigrating(room)) {
       broadcastParticipants(room);
