@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v0.4.2-beta
+// Cineminha — Servidor WebSocket v0.4.3-beta
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -103,7 +103,7 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    name: 'Cineminha Server', status: 'online', version: '0.4.2-beta',
+    name: 'Cineminha Server', status: 'online', version: '0.4.3-beta',
     rooms: rooms.size,
     clients: Array.from(rooms.values()).reduce((a, r) => a + r.clients.size, 0),
   }));
@@ -401,6 +401,20 @@ wss.on('connection', (ws, req) => {
         broadcastReadiness(room);
         break;
       }
+      case 'force_clear_ad': {
+        // Host força limpeza dos status 'ad' — escape hatch para falso positivo
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        let changed = false;
+        room.readiness.forEach((r, cid) => {
+          if (r.status === 'ad') {
+            room.readiness.delete(cid);
+            changed = true;
+          }
+        });
+        if (changed) broadcastReadiness(room);
+        break;
+      }
       case 'readiness': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
@@ -512,7 +526,7 @@ setInterval(() => {
 }, 30_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v0.4.2-beta rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v0.4.3-beta rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
