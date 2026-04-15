@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v4.2.0
+// Cineminha — Servidor WebSocket v0.4.2-beta
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -66,6 +66,8 @@ function broadcastParticipants(room) {
 function getReadinessList(room) {
   const notReady = [];
   room.clients.forEach((client, id) => {
+    // O host controla o vídeo, nunca aparece como "não pronto"
+    if (id === room.hostId) return;
     const r = room.readiness.get(id);
     if (!r || r.status === 'ready') return;
     notReady.push({
@@ -101,7 +103,7 @@ const server = http.createServer((req, res) => {
   }
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({
-    name: 'Cineminha Server', status: 'online', version: '4.2.0',
+    name: 'Cineminha Server', status: 'online', version: '0.4.2-beta',
     rooms: rooms.size,
     clients: Array.from(rooms.values()).reduce((a, r) => a + r.clients.size, 0),
   }));
@@ -485,18 +487,32 @@ wss.on('connection', (ws, req) => {
   }
 });
 
+// Failsafe: limpa readiness 'ad' que ficou parado >120s.
+// Cobre o caso raro do detector de ad ficar preso em true.
+const AD_READINESS_MAX_MS = 120_000;
+
 setInterval(() => {
   const now = Date.now();
   rooms.forEach((room, id) => {
     if (room.clients.size === 0 && room.emptyAt && now - room.emptyAt > 5 * 60 * 1000) {
       if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
       rooms.delete(id);
+      return;
     }
+    // Expira readiness 'ad' antigo
+    let changed = false;
+    room.readiness.forEach((r, cid) => {
+      if (r.status === 'ad' && (now - r.since) > AD_READINESS_MAX_MS) {
+        room.readiness.delete(cid);
+        changed = true;
+      }
+    });
+    if (changed) broadcastReadiness(room);
   });
-}, 60_000);
+}, 30_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v4.2 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v0.4.2-beta rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
