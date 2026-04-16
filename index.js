@@ -1,8 +1,7 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v26.1.0.0
-// Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
-// estimado restante de anúncio.
-// Rate limiting por IP + token bucket; timestamps removidos
+// Cineminha — Servidor WebSocket v26.2.0.0
+// 🆕 v26.2.0.0: Relay de sinalização WebRTC para screen sharing
+// (host → guests em mesh P2P). Servidor NÃO trafega mídia.
 // ============================================================
 'use strict';
 
@@ -15,11 +14,11 @@ const PORT = process.env.PORT || 3000;
 const MAX_CONNECTIONS_PER_IP = 10;
 const MSG_RATE_REFILL_PER_SEC = 30;
 const MSG_RATE_BURST = 50;
-// 🆕 v26.1.0.0 — Grace do host aumentado de 15s → 90s.
+// 🆕 v26.1.1.0 — Grace do host aumentado de 15s → 90s.
 // Motivo: SW MV3 do Chrome pode dormir e levar tempo pra reconectar.
 // Com 90s, host pode ausentar 1min30s sem perder a sala.
 const HOST_ORPHAN_GRACE_MS = 90_000;
-// 🆕 v26.1.0.0 — Debounce de mudança de plataforma (evita ping-pong)
+// 🆕 v26.1.1.0 — Debounce de mudança de plataforma (evita ping-pong)
 const PLATFORM_CHANGE_DEBOUNCE_MS = 5_000;
 const MIGRATION_WINDOW_MS = 20_000;
 
@@ -195,6 +194,9 @@ wss.on('connection', (ws, req) => {
           locked: false, mutedUsers: new Set(),
           readiness: new Map(),
           hostOrphanedAt: null, hostOrphanTimer: null,
+          // 🆕 v26.2.0.0 — Screen share
+          screenShareActive: false,
+          screenShareStartedAt: null,
         });
         currentRoomId = roomId;
         sendTo(ws, {
@@ -223,6 +225,7 @@ wss.on('connection', (ws, req) => {
           contentTitle: room.contentTitle || null,
           platform: room.platform,
           notReady: getReadinessList(room),
+          screenShareActive: !!room.screenShareActive, // 🆕 v26.2.0.0
         });
         if (isMigrating(room)) {
           broadcastParticipants(room);
@@ -387,7 +390,7 @@ wss.on('connection', (ws, req) => {
           sendTo(ws, { type: 'error', message: 'URL não é de uma plataforma suportada.' });
           return;
         }
-        // 🆕 v26.1.0.0 — Sala agora PODE mudar de plataforma!
+        // 🆕 v26.1.1.0 — Sala agora PODE mudar de plataforma!
         // Debounce: mínimo 5s entre mudanças (evita ping-pong).
         const isPlatformChange = !!room.platform && room.platform !== newPlatform;
         if (isPlatformChange) {
@@ -461,6 +464,72 @@ wss.on('connection', (ws, req) => {
         broadcast(room, { type: 'content_title', title, platform: sanitizeText(msg.platform, 40) || null });
         break;
       }
+      // ============================================================
+      // 🆕 v26.2.0.0 — Screen sharing (WebRTC signaling relay)
+      // ============================================================
+      // O servidor NÃO trafega mídia: apenas faz relay de mensagens de
+      // sinalização entre host (broadcaster) e guests (viewers).
+      // Topologia: mesh P2P (host envia 1 PeerConnection por guest).
+      case 'screenshare_start': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        room.screenShareActive = true;
+        room.screenShareStartedAt = Date.now();
+        broadcast(room, {
+          type: 'screenshare_started',
+          hostId: clientId,
+          hostName: clientName,
+          hasAudio: !!msg.hasAudio,
+        });
+        break;
+      }
+      case 'screenshare_stop': {
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        room.screenShareActive = false;
+        room.screenShareStartedAt = null;
+        broadcast(room, { type: 'screenshare_stopped', hostId: clientId });
+        break;
+      }
+      // Guest pede pra entrar no stream atual do host
+      case 'screenshare_request': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.screenShareActive) return;
+        if (clientId === room.hostId) return; // host não pede pra si mesmo
+        const host = room.clients.get(room.hostId);
+        if (!host) return;
+        sendTo(host.ws, {
+          type: 'screenshare_request',
+          viewerId: clientId,
+          viewerName: clientName,
+        });
+        break;
+      }
+      // Sinalização WebRTC: offer/answer/ice — relay direcionado
+      case 'rtc_signal': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        const targetId = msg.targetId;
+        if (!targetId || typeof targetId !== 'string') return;
+        const target = room.clients.get(targetId);
+        if (!target) return;
+        // Só permite sinalização entre host e guests (não guest↔guest)
+        if (clientId !== room.hostId && targetId !== room.hostId) return;
+        const payload = msg.payload;
+        if (!payload || typeof payload !== 'object') return;
+        // Limite de tamanho básico (SDP pode ser grande, ~20KB é seguro)
+        try {
+          const size = JSON.stringify(payload).length;
+          if (size > 32_000) return;
+        } catch { return; }
+        sendTo(target.ws, {
+          type: 'rtc_signal',
+          fromId: clientId,
+          fromName: clientName,
+          payload,
+        });
+        break;
+      }
       case 'ping': { sendTo(ws, { type: 'pong' }); break; }
       default: break;
     }
@@ -478,6 +547,12 @@ wss.on('connection', (ws, req) => {
     room.mutedUsers.delete(clientId);
     room.readiness.delete(clientId);
     if (room.hostId === clientId) {
+      // 🆕 v26.2.0.0 — Screen share do host cai junto com o host
+      if (room.screenShareActive) {
+        room.screenShareActive = false;
+        room.screenShareStartedAt = null;
+        broadcast(room, { type: 'screenshare_stopped', hostId: clientId, reason: 'host_left' });
+      }
       if (room.clients.size === 0) {
         rooms.delete(currentRoomId);
       } else {
@@ -499,7 +574,7 @@ wss.on('connection', (ws, req) => {
           room.hostOrphanTimer = null;
           room.readiness.delete(newHostId);
           sendTo(newHost.ws, { type: 'host_promoted', hostToken: room.hostToken });
-          // 🆕 v26.1.0.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
+          // 🆕 v26.1.1.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
           // que aciona o mesmo toast localmente. Antes duplicava).
           broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name }, newHostId);
           broadcastParticipants(room);
@@ -514,6 +589,11 @@ wss.on('connection', (ws, req) => {
       broadcastParticipants(room);
       broadcastReadiness(room);
     } else {
+      // 🆕 v26.2.0.0 — Se screen share ativo, avisa o host pra fechar a PC do viewer que saiu
+      if (room.screenShareActive) {
+        const host = room.clients.get(room.hostId);
+        if (host) sendTo(host.ws, { type: 'screenshare_viewer_left', viewerId: clientId });
+      }
       broadcast(room, {
         type: 'user_left', clientId, name: clientName,
         participants: getParticipantsList(room),
@@ -535,7 +615,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v26.1.0 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v26.2.0 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
