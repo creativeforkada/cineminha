@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v26.0.14.0
+// Cineminha — Servidor WebSocket v2.26.1.0.0
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -564,7 +564,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v0.14.0-beta rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v2.26.1.0.0 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
