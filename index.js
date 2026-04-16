@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v2.26.1.1.1
+// Cineminha — Servidor WebSocket v26.1.1.0
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -15,11 +15,11 @@ const PORT = process.env.PORT || 3000;
 const MAX_CONNECTIONS_PER_IP = 10;
 const MSG_RATE_REFILL_PER_SEC = 30;
 const MSG_RATE_BURST = 50;
-// 🆕 v2.26.1.1.1 — Grace do host aumentado de 15s → 90s.
+// 🆕 v26.1.1.0 — Grace do host aumentado de 15s → 90s.
 // Motivo: SW MV3 do Chrome pode dormir e levar tempo pra reconectar.
 // Com 90s, host pode ausentar 1min30s sem perder a sala.
 const HOST_ORPHAN_GRACE_MS = 90_000;
-// 🆕 v2.26.1.1.1 — Debounce de mudança de plataforma (evita ping-pong)
+// 🆕 v26.1.1.0 — Debounce de mudança de plataforma (evita ping-pong)
 const PLATFORM_CHANGE_DEBOUNCE_MS = 5_000;
 const MIGRATION_WINDOW_MS = 20_000;
 
@@ -436,7 +436,7 @@ wss.on('connection', (ws, req) => {
           sendTo(ws, { type: 'error', message: 'URL não é de uma plataforma suportada.' });
           return;
         }
-        // 🆕 v2.26.1.1.1 — Sala agora PODE mudar de plataforma!
+        // 🆕 v26.1.1.0 — Sala agora PODE mudar de plataforma!
         // Debounce: mínimo 5s entre mudanças (evita ping-pong).
         const isPlatformChange = !!room.platform && room.platform !== newPlatform;
         if (isPlatformChange) {
@@ -447,7 +447,7 @@ wss.on('connection', (ws, req) => {
             sendTo(ws, {
               type: 'platform_change_throttled',
               waitSec,
-              message: `Aguarde ${waitSec}s antes de trocar de plataforma novamente.`,
+              message: `Aguarde ${waitSec} segundo${waitSec !== 1 ? 's' : ''} antes de trocar de plataforma novamente.`,
             });
             return;
           }
@@ -548,7 +548,7 @@ wss.on('connection', (ws, req) => {
           room.hostOrphanTimer = null;
           room.readiness.delete(newHostId);
           sendTo(newHost.ws, { type: 'host_promoted', hostToken: room.hostToken });
-          // 🆕 v2.26.1.1.1 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
+          // 🆕 v26.1.1.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
           // que aciona o mesmo toast localmente. Antes duplicava).
           broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name }, newHostId);
           broadcastParticipants(room);
@@ -584,7 +584,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v2.26.1.1.1 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v26.1.1 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
