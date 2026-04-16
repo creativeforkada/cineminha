@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v2.26.1.1.0
+// Cineminha — Servidor WebSocket v2.26.1.1.1
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -15,10 +15,12 @@ const PORT = process.env.PORT || 3000;
 const MAX_CONNECTIONS_PER_IP = 10;
 const MSG_RATE_REFILL_PER_SEC = 30;
 const MSG_RATE_BURST = 50;
-// 🆕 v2.26.1.1.0 — Grace do host aumentado de 15s → 90s.
+// 🆕 v2.26.1.1.1 — Grace do host aumentado de 15s → 90s.
 // Motivo: SW MV3 do Chrome pode dormir e levar tempo pra reconectar.
 // Com 90s, host pode ausentar 1min30s sem perder a sala.
 const HOST_ORPHAN_GRACE_MS = 90_000;
+// 🆕 v2.26.1.1.1 — Debounce de mudança de plataforma (evita ping-pong)
+const PLATFORM_CHANGE_DEBOUNCE_MS = 5_000;
 const MIGRATION_WINDOW_MS = 20_000;
 
 const rooms = new Map();
@@ -434,18 +436,25 @@ wss.on('connection', (ws, req) => {
           sendTo(ws, { type: 'error', message: 'URL não é de uma plataforma suportada.' });
           return;
         }
-        // 🆕 v0.5: Se a sala ainda não tem plataforma definida, define agora.
-        // Se já tem, REJEITA mudança para outra plataforma.
-        if (room.platform && room.platform !== newPlatform) {
-          sendTo(ws, {
-            type: 'platform_mismatch',
-            currentPlatform: room.platform,
-            newPlatform,
-            attemptedUrl: newUrl,
-          });
-          return;
+        // 🆕 v2.26.1.1.1 — Sala agora PODE mudar de plataforma!
+        // Debounce: mínimo 5s entre mudanças (evita ping-pong).
+        const isPlatformChange = !!room.platform && room.platform !== newPlatform;
+        if (isPlatformChange) {
+          const now = Date.now();
+          const lastChange = room.lastPlatformChangeAt || 0;
+          if (now - lastChange < PLATFORM_CHANGE_DEBOUNCE_MS) {
+            const waitSec = Math.ceil((PLATFORM_CHANGE_DEBOUNCE_MS - (now - lastChange)) / 1000);
+            sendTo(ws, {
+              type: 'platform_change_throttled',
+              waitSec,
+              message: `Aguarde ${waitSec}s antes de trocar de plataforma novamente.`,
+            });
+            return;
+          }
+          room.lastPlatformChangeAt = now;
         }
-        if (!room.platform) {
+        const oldPlatform = room.platform;
+        if (!room.platform || isPlatformChange) {
           room.platform = newPlatform;
           broadcast(room, { type: 'platform_set', platform: newPlatform });
         }
@@ -455,7 +464,13 @@ wss.on('connection', (ws, req) => {
         room.state.updatedAt = Date.now();
         room.migrationUntil = Date.now() + MIGRATION_WINDOW_MS;
         room.readiness.clear();
-        broadcast(room, { type: 'host_navigate', contentUrl: newUrl });
+        broadcast(room, {
+          type: 'host_navigate',
+          contentUrl: newUrl,
+          platform: newPlatform,
+          platformChanged: isPlatformChange,
+          previousPlatform: oldPlatform || null,
+        });
         broadcastReadiness(room);
         break;
       }
@@ -533,7 +548,7 @@ wss.on('connection', (ws, req) => {
           room.hostOrphanTimer = null;
           room.readiness.delete(newHostId);
           sendTo(newHost.ws, { type: 'host_promoted', hostToken: room.hostToken });
-          // 🆕 v2.26.1.1.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
+          // 🆕 v2.26.1.1.1 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
           // que aciona o mesmo toast localmente. Antes duplicava).
           broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name }, newHostId);
           broadcastParticipants(room);
@@ -569,7 +584,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v2.26.1.1.0 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v2.26.1.1.1 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
