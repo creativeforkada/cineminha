@@ -1,8 +1,5 @@
 // ============================================================
 // Cineminha — Servidor WebSocket v26.1.0.0
-// Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
-// estimado restante de anúncio.
-// Rate limiting por IP + token bucket; timestamps removidos
 // ============================================================
 'use strict';
 
