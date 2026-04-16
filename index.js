@@ -1,5 +1,8 @@
 // ============================================================
 // Cineminha — Servidor WebSocket v26.1.0.0
+// Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
+// estimado restante de anúncio.
+// Rate limiting por IP + token bucket; timestamps removidos
 // ============================================================
 'use strict';
 
@@ -331,7 +334,7 @@ wss.on('connection', (ws, req) => {
       case 'reaction': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
-        const allowed = ['❤️', '😂', '😮', '😢', '🔥', '👏'];
+        const allowed = ['❤️', '😂', '😮', '😢', '🔥', '👏', '🍿', '👀'];
         if (!allowed.includes(msg.emoji)) return;
         broadcast(room, { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId });
         break;
