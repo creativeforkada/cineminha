@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v26.1.1.0
+// Cineminha — Servidor WebSocket v26.1.0.0
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -15,11 +15,11 @@ const PORT = process.env.PORT || 3000;
 const MAX_CONNECTIONS_PER_IP = 10;
 const MSG_RATE_REFILL_PER_SEC = 30;
 const MSG_RATE_BURST = 50;
-// 🆕 v26.1.1.0 — Grace do host aumentado de 15s → 90s.
+// 🆕 v26.1.0.0 — Grace do host aumentado de 15s → 90s.
 // Motivo: SW MV3 do Chrome pode dormir e levar tempo pra reconectar.
 // Com 90s, host pode ausentar 1min30s sem perder a sala.
 const HOST_ORPHAN_GRACE_MS = 90_000;
-// 🆕 v26.1.1.0 — Debounce de mudança de plataforma (evita ping-pong)
+// 🆕 v26.1.0.0 — Debounce de mudança de plataforma (evita ping-pong)
 const PLATFORM_CHANGE_DEBOUNCE_MS = 5_000;
 const MIGRATION_WINDOW_MS = 20_000;
 
@@ -107,32 +107,6 @@ function isMigrating(room) {
   return !!(room && room.migrationUntil && Date.now() < room.migrationUntil);
 }
 
-// 🆕 v26.1.2.0 — Serializa poll pro client (oculta timer interno, converte Set).
-function serializePoll(poll) {
-  return {
-    id: poll.id,
-    question: poll.question,
-    options: poll.options,
-    votes: poll.votes,
-    voterNames: poll.voterNames,
-    ended: !!poll.ended,
-    durationMs: poll.durationMs || 0,
-    endsAt: poll.endsAt || 0,
-  };
-}
-function serializeActivePolls(room) {
-  return room.polls.filter(p => !p.ended).map(serializePoll);
-}
-
-// 🆕 v26.1.2.0 — Limpa timers de auto-encerramento de todas as polls da sala.
-// Chamado antes de destruir a sala para evitar vazamento.
-function clearPollTimers(room) {
-  if (!room || !room.polls) return;
-  for (const p of room.polls) {
-    if (p.autoEndTimer) { clearTimeout(p.autoEndTimer); p.autoEndTimer = null; }
-  }
-}
-
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -218,7 +192,7 @@ wss.on('connection', (ws, req) => {
           contentUrl: initialUrl,
           contentTitle: null, // 🆕 v0.11 — título do vídeo extraído do <title> da página
           platform: initialPlatform, // 🆕 v0.5: trava da plataforma
-          locked: false, mutedUsers: new Set(), polls: [],
+          locked: false, mutedUsers: new Set(),
           readiness: new Map(),
           hostOrphanedAt: null, hostOrphanTimer: null,
         });
@@ -244,7 +218,6 @@ wss.on('connection', (ws, req) => {
           state: room.state,
           participants: getParticipantsList(room),
           isHost: room.hostId === clientId,
-          polls: serializeActivePolls(room),
           locked: room.locked,
           contentUrl: room.contentUrl,
           contentTitle: room.contentTitle || null,
@@ -282,7 +255,6 @@ wss.on('connection', (ws, req) => {
           hostToken: room.hostToken,
           state: room.state, isHost: true,
           participants: getParticipantsList(room),
-          polls: serializeActivePolls(room),
           locked: room.locked,
           contentUrl: room.contentUrl,
           contentTitle: room.contentTitle || null,
@@ -300,7 +272,6 @@ wss.on('connection', (ws, req) => {
         if (!room || room.hostId !== clientId) return;
         broadcast(room, { type: 'room_closed', reason: msg.reason || 'Host encerrou a sala.' });
         if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
-        clearPollTimers(room);
         rooms.delete(currentRoomId);
         currentRoomId = null;
         break;
@@ -368,80 +339,6 @@ wss.on('connection', (ws, req) => {
         broadcast(room, { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId });
         break;
       }
-      case 'poll_create': {
-        // 🆕 v26.1.2.0 — Duração é autoritativa no servidor; trava contra poll ativa;
-        // voters como Set; auto-encerramento agendado server-side.
-        const room = rooms.get(currentRoomId);
-        if (!room || room.hostId !== clientId) return;
-        // Trava: só uma enquete ativa por sala
-        if (room.polls.some(p => !p.ended)) {
-          sendTo(ws, { type: 'error', message: 'Já existe uma enquete ativa nesta sala.' });
-          return;
-        }
-        const question = sanitizeText(msg.question, 150);
-        const options = (msg.options || []).slice(0, 4).map(o => sanitizeText(o, 80)).filter(Boolean);
-        if (!question || options.length < 2) return;
-        // Duração validada: 0 (manual) ou entre 5s e 10min
-        let durationMs = Number(msg.durationMs) || 0;
-        if (!Number.isFinite(durationMs) || durationMs < 0) durationMs = 0;
-        if (durationMs > 0 && durationMs < 5_000) durationMs = 5_000;
-        if (durationMs > 600_000) durationMs = 600_000;
-        const createdAt = Date.now();
-        const endsAt = durationMs > 0 ? createdAt + durationMs : 0;
-        const poll = {
-          id: uuidv4().substring(0, 8),
-          question, options,
-          votes: new Array(options.length).fill(0),
-          voters: new Set(), // quem já votou (clientIds) — O(1)
-          voterNames: options.map(() => []), // nomes por opção
-          ended: false,
-          createdAt, durationMs, endsAt,
-          autoEndTimer: null,
-        };
-        room.polls.push(poll);
-        if (endsAt > 0) {
-          poll.autoEndTimer = setTimeout(() => {
-            if (poll.ended) return;
-            poll.ended = true;
-            poll.autoEndTimer = null;
-            broadcast(room, { type: 'poll_ended', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames });
-          }, durationMs);
-        }
-        broadcast(room, {
-          type: 'poll_created',
-          poll: {
-            id: poll.id, question: poll.question, options: poll.options,
-            votes: poll.votes, voterNames: poll.voterNames, ended: false,
-            durationMs, endsAt,
-          },
-        });
-        break;
-      }
-      case 'poll_vote': {
-        const room = rooms.get(currentRoomId);
-        if (!room) return;
-        const poll = room.polls.find(p => p.id === msg.pollId && !p.ended);
-        if (!poll) return;
-        const idx = Number(msg.optionIndex);
-        if (!Number.isInteger(idx) || idx < 0 || idx >= poll.options.length) return;
-        if (poll.voters.has(clientId)) return; // já votou
-        poll.voters.add(clientId);
-        poll.votes[idx] = (poll.votes[idx] || 0) + 1;
-        if (!Array.isArray(poll.voterNames[idx])) poll.voterNames[idx] = [];
-        poll.voterNames[idx].push(clientName);
-        broadcast(room, { type: 'poll_updated', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames });
-        break;
-      }
-      case 'poll_end': {
-        const room = rooms.get(currentRoomId);
-        if (!room || room.hostId !== clientId) return;
-        const poll = room.polls.find(p => p.id === msg.pollId && !p.ended);
-        if (!poll) return;
-        poll.ended = true;
-        if (poll.autoEndTimer) { clearTimeout(poll.autoEndTimer); poll.autoEndTimer = null; }
-        broadcast(room, { type: 'poll_ended', pollId: poll.id, votes: poll.votes, voterNames: poll.voterNames });
-        break;
-      }
       case 'kick_user': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
@@ -490,7 +387,7 @@ wss.on('connection', (ws, req) => {
           sendTo(ws, { type: 'error', message: 'URL não é de uma plataforma suportada.' });
           return;
         }
-        // 🆕 v26.1.1.0 — Sala agora PODE mudar de plataforma!
+        // 🆕 v26.1.0.0 — Sala agora PODE mudar de plataforma!
         // Debounce: mínimo 5s entre mudanças (evita ping-pong).
         const isPlatformChange = !!room.platform && room.platform !== newPlatform;
         if (isPlatformChange) {
@@ -582,20 +479,19 @@ wss.on('connection', (ws, req) => {
     room.readiness.delete(clientId);
     if (room.hostId === clientId) {
       if (room.clients.size === 0) {
-        clearPollTimers(room);
         rooms.delete(currentRoomId);
       } else {
         room.hostOrphanedAt = Date.now();
         if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
         room.hostOrphanTimer = setTimeout(() => {
           if (!rooms.has(room.id)) return;
-          if (room.clients.size === 0) { clearPollTimers(room); rooms.delete(room.id); return; }
+          if (room.clients.size === 0) { rooms.delete(room.id); return; }
           let newHostId = null;
           let oldest = Infinity;
           room.clients.forEach((c, id) => {
             if (c.joinedAt < oldest) { oldest = c.joinedAt; newHostId = id; }
           });
-          if (!newHostId) { clearPollTimers(room); rooms.delete(room.id); return; }
+          if (!newHostId) { rooms.delete(room.id); return; }
           const newHost = room.clients.get(newHostId);
           room.hostId = newHostId;
           room.hostToken = generateHostToken();
@@ -603,7 +499,7 @@ wss.on('connection', (ws, req) => {
           room.hostOrphanTimer = null;
           room.readiness.delete(newHostId);
           sendTo(newHost.ws, { type: 'host_promoted', hostToken: room.hostToken });
-          // 🆕 v26.1.1.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
+          // 🆕 v26.1.0.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
           // que aciona o mesmo toast localmente. Antes duplicava).
           broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name }, newHostId);
           broadcastParticipants(room);
@@ -633,14 +529,13 @@ setInterval(() => {
   rooms.forEach((room, id) => {
     if (room.clients.size === 0 && room.emptyAt && now - room.emptyAt > 5 * 60 * 1000) {
       if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
-      clearPollTimers(room);
       rooms.delete(id);
     }
   });
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v26.1.1 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v26.1.0 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
