@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v2.26.1.0.0
+// Cineminha — Servidor WebSocket v2.26.1.1.0
 // Mudanças v4.2: campo adSeconds no readiness para mostrar tempo
 // estimado restante de anúncio.
 // Rate limiting por IP + token bucket; timestamps removidos
@@ -15,7 +15,10 @@ const PORT = process.env.PORT || 3000;
 const MAX_CONNECTIONS_PER_IP = 10;
 const MSG_RATE_REFILL_PER_SEC = 30;
 const MSG_RATE_BURST = 50;
-const HOST_ORPHAN_GRACE_MS = 15_000;
+// 🆕 v2.26.1.1.0 — Grace do host aumentado de 15s → 90s.
+// Motivo: SW MV3 do Chrome pode dormir e levar tempo pra reconectar.
+// Com 90s, host pode ausentar 1min30s sem perder a sala.
+const HOST_ORPHAN_GRACE_MS = 90_000;
 const MIGRATION_WINDOW_MS = 20_000;
 
 const rooms = new Map();
@@ -530,7 +533,9 @@ wss.on('connection', (ws, req) => {
           room.hostOrphanTimer = null;
           room.readiness.delete(newHostId);
           sendTo(newHost.ws, { type: 'host_promoted', hostToken: room.hostToken });
-          broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name });
+          // 🆕 v2.26.1.1.0 — Exclui o novo host do broadcast (ele já recebeu host_promoted,
+          // que aciona o mesmo toast localmente. Antes duplicava).
+          broadcast(room, { type: 'new_host', clientId: newHostId, name: newHost.name }, newHostId);
           broadcastParticipants(room);
           broadcastReadiness(room);
         }, HOST_ORPHAN_GRACE_MS);
@@ -564,7 +569,7 @@ setInterval(() => {
 }, 60_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v2.26.1.0.0 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v2.26.1.1.0 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
