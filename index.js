@@ -183,27 +183,30 @@ wss.on('connection', (ws, req) => {
         clientName = sanitizeName(msg.name);
         const initialUrl = sanitizeText(msg.contentUrl, 500) || null;
         const initialPlatform = detectPlatform(initialUrl);
+        // 🆕 v26.2.1.0 — Modo da sala ('cinema' = sync de plataforma; 'screen' = transmissão de tela)
+        const initialMode = (msg.mode === 'screen' || msg.mode === 'cinema') ? msg.mode : 'cinema';
         rooms.set(roomId, {
           id: roomId, hostId: clientId, hostToken,
           clients: new Map([[clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() }]]),
           state: { currentTime: 0, playing: false, updatedAt: Date.now() },
           createdAt: Date.now(),
-          contentUrl: initialUrl,
-          contentTitle: null, // 🆕 v0.11 — título do vídeo extraído do <title> da página
-          platform: initialPlatform, // 🆕 v0.5: trava da plataforma
+          contentUrl: initialMode === 'screen' ? null : initialUrl,
+          contentTitle: null,
+          platform: initialMode === 'screen' ? null : initialPlatform,
           locked: false, mutedUsers: new Set(),
           readiness: new Map(),
           hostOrphanedAt: null, hostOrphanTimer: null,
-          // 🆕 v26.2.0.0 — Screen share
           screenShareActive: false,
           screenShareStartedAt: null,
           screenShareHasAudio: false,
+          mode: initialMode,
         });
         currentRoomId = roomId;
         sendTo(ws, {
           type: 'room_created',
           roomId, clientId, hostToken,
-          platform: initialPlatform,
+          platform: initialMode === 'screen' ? null : initialPlatform,
+          mode: initialMode,
           participants: getParticipantsList(rooms.get(roomId)),
         });
         break;
@@ -216,8 +219,6 @@ wss.on('connection', (ws, req) => {
         clientName = sanitizeName(msg.name);
         currentRoomId = msg.roomId;
         room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() });
-        // 🆕 v26.2.0.0 — Se há transmissão ativa, inclui nome do host e hasAudio
-        // para que o guest consiga montar a UI certa e auto-conectar.
         const ssHostClient = room.screenShareActive ? room.clients.get(room.hostId) : null;
         sendTo(ws, {
           type: 'room_joined', roomId: msg.roomId, clientId,
@@ -229,9 +230,10 @@ wss.on('connection', (ws, req) => {
           contentTitle: room.contentTitle || null,
           platform: room.platform,
           notReady: getReadinessList(room),
-          screenShareActive: !!room.screenShareActive, // 🆕 v26.2.0.0
+          screenShareActive: !!room.screenShareActive,
           screenShareHostName: ssHostClient ? ssHostClient.name : null,
           screenShareHasAudio: !!room.screenShareHasAudio,
+          mode: room.mode || 'cinema', // 🆕 v26.2.1.0
         });
         if (isMigrating(room)) {
           broadcastParticipants(room);
@@ -269,6 +271,7 @@ wss.on('connection', (ws, req) => {
           contentTitle: room.contentTitle || null,
           platform: room.platform,
           notReady: getReadinessList(room),
+          mode: room.mode || 'cinema', // 🆕 v26.2.1.0
         });
         broadcast(room, { type: 'new_host', clientId, name: clientName }, clientId);
         broadcastParticipants(room);
@@ -385,9 +388,28 @@ wss.on('connection', (ws, req) => {
         broadcast(room, { type: 'room_locked', locked: room.locked });
         break;
       }
+      case 'change_mode': {
+        // 🆕 v26.2.1.0 — Só o host pode trocar o modo
+        const room = rooms.get(currentRoomId);
+        if (!room || room.hostId !== clientId) return;
+        const newMode = (msg.mode === 'screen' || msg.mode === 'cinema') ? msg.mode : null;
+        if (!newMode || newMode === room.mode) return;
+        room.mode = newMode;
+        // Mudou pra 'screen': zera conteúdo/plataforma sincronizados
+        if (newMode === 'screen') {
+          room.contentUrl = null;
+          room.contentTitle = null;
+          room.platform = null;
+          room.readiness.clear();
+        }
+        broadcast(room, { type: 'mode_changed', mode: newMode, changedBy: clientName });
+        if (newMode === 'cinema') broadcastReadiness(room);
+        break;
+      }
       case 'host_navigate': {
         const room = rooms.get(currentRoomId);
         if (!room || room.hostId !== clientId) return;
+        if (room.mode === 'screen') return; // 🆕 v26.2.1.0 — nav desabilitada em modo tela
         const newUrl = sanitizeText(msg.contentUrl, 500);
         if (!newUrl) return;
         if (newUrl === room.contentUrl) return;
@@ -462,10 +484,11 @@ wss.on('connection', (ws, req) => {
       case 'content_title': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
-        if (room.hostId !== clientId) return; // só host pode setar
+        if (room.hostId !== clientId) return;
+        if (room.mode === 'screen') return; // 🆕 v26.2.1.0 — sem sync de conteúdo em modo tela
         const title = sanitizeText(msg.title, 200);
         if (!title) return;
-        if (room.contentTitle === title) return; // sem mudança, não rebroadcast
+        if (room.contentTitle === title) return;
         room.contentTitle = title;
         broadcast(room, { type: 'content_title', title, platform: sanitizeText(msg.platform, 40) || null });
         break;
