@@ -197,6 +197,7 @@ wss.on('connection', (ws, req) => {
           // 🆕 v26.2.0.0 — Screen share
           screenShareActive: false,
           screenShareStartedAt: null,
+          screenShareHasAudio: false,
         });
         currentRoomId = roomId;
         sendTo(ws, {
@@ -215,6 +216,9 @@ wss.on('connection', (ws, req) => {
         clientName = sanitizeName(msg.name);
         currentRoomId = msg.roomId;
         room.clients.set(clientId, { ws, name: clientName, avatar: msg.avatar || '😎', nameColor: sanitizeColor(msg.nameColor), status: 'active', joinedAt: Date.now() });
+        // 🆕 v26.2.0.0 — Se há transmissão ativa, inclui nome do host e hasAudio
+        // para que o guest consiga montar a UI certa e auto-conectar.
+        const ssHostClient = room.screenShareActive ? room.clients.get(room.hostId) : null;
         sendTo(ws, {
           type: 'room_joined', roomId: msg.roomId, clientId,
           state: room.state,
@@ -226,6 +230,8 @@ wss.on('connection', (ws, req) => {
           platform: room.platform,
           notReady: getReadinessList(room),
           screenShareActive: !!room.screenShareActive, // 🆕 v26.2.0.0
+          screenShareHostName: ssHostClient ? ssHostClient.name : null,
+          screenShareHasAudio: !!room.screenShareHasAudio,
         });
         if (isMigrating(room)) {
           broadcastParticipants(room);
@@ -475,6 +481,7 @@ wss.on('connection', (ws, req) => {
         if (!room || room.hostId !== clientId) return;
         room.screenShareActive = true;
         room.screenShareStartedAt = Date.now();
+        room.screenShareHasAudio = !!msg.hasAudio;
         broadcast(room, {
           type: 'screenshare_started',
           hostId: clientId,
@@ -488,6 +495,7 @@ wss.on('connection', (ws, req) => {
         if (!room || room.hostId !== clientId) return;
         room.screenShareActive = false;
         room.screenShareStartedAt = null;
+        room.screenShareHasAudio = false;
         broadcast(room, { type: 'screenshare_stopped', hostId: clientId });
         break;
       }
@@ -551,6 +559,7 @@ wss.on('connection', (ws, req) => {
       if (room.screenShareActive) {
         room.screenShareActive = false;
         room.screenShareStartedAt = null;
+        room.screenShareHasAudio = false;
         broadcast(room, { type: 'screenshare_stopped', hostId: clientId, reason: 'host_left' });
       }
       if (room.clients.size === 0) {
