@@ -1,5 +1,7 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v26.3.0.0
+// Cineminha — Servidor WebSocket v26.3.2.0
+// 🆕 v26.2.0.0: Relay de sinalização WebRTC para screen sharing
+// (host → guests em mesh P2P). Servidor NÃO trafega mídia.
 // ============================================================
 'use strict';
 
@@ -339,11 +341,19 @@ wss.on('connection', (ws, req) => {
         const text = sanitizeText(msg.message);
         if (!text) return;
         const sender = room.clients.get(clientId);
+        // 🆕 v26.3.1.0 — Suporte a reply: valida e sanitiza o replyTo
+        let replyTo = null;
+        if (msg.replyTo && typeof msg.replyTo === 'object') {
+          const rName = typeof msg.replyTo.name === 'string' ? msg.replyTo.name.slice(0, 40) : '';
+          const rText = typeof msg.replyTo.text === 'string' ? msg.replyTo.text.slice(0, 200) : '';
+          if (rName && rText) replyTo = { name: rName, text: rText };
+        }
         broadcast(room, {
           type: 'chat', clientId, name: clientName,
           avatar: sender?.avatar || '😎',
           nameColor: sender?.nameColor || '#f0f0f5',
           message: text, ts: Date.now(),
+          ...(replyTo ? { replyTo } : {}),
         });
         break;
       }
@@ -353,6 +363,15 @@ wss.on('connection', (ws, req) => {
         const allowed = ['❤️', '😂', '😮', '😢', '🔥', '👏', '🍿', '👀'];
         if (!allowed.includes(msg.emoji)) return;
         broadcast(room, { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId });
+        break;
+      }
+      // 🆕 v26.3.1.0 — Indicador "está digitando". Broadcast efêmero,
+      // sem persistência. Clientes expiram localmente após ~3s sem update.
+      case 'typing': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        if (room.mutedUsers && room.mutedUsers.has(clientId)) return;
+        broadcast(room, { type: 'typing', name: clientName, senderId: clientId, active: !!msg.active }, clientId);
         break;
       }
       case 'kick_user': {
