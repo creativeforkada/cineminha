@@ -362,9 +362,10 @@ wss.on('connection', (ws, req) => {
         break;
       }
       // 🆕 v26.4.1 — G1: Sistema de votação pra pausar.
-      // Regras (maioria simples = solicitante + ≥1 de outros):
+      // Regras:
       //   - Solicitante conta automaticamente como "sim"
-      //   - Precisa de pelo menos 1 voto de outro participante pra aprovar
+      //   - Com 2 pessoas: threshold=1 (o outro usuário precisa aprovar)
+      //   - Com 3+: threshold=1 (maioria simples: solicitante + ≥1)
       //   - Timeout de 15s; se não atingir quorum, expira silenciosamente
       //   - Rate-limit: 1 pedido a cada 10s por cliente
       //   - Se só tem 1 pessoa na sala, pedido não é aceito (deve pausar sozinho)
@@ -381,7 +382,11 @@ wss.on('connection', (ws, req) => {
         client.lastPauseReqAt = now;
 
         const voteId = `v_${now}_${Math.random().toString(36).slice(2, 8)}`;
-        const threshold = 1; // +1 além do solicitante (maioria simples)
+        const othersCount = room.clients.size - 1;
+        // Threshold: +1 pessoa além do solicitante.
+        // (Funciona igual pra 2p ou 3+: precisa que o solicitante convença
+        // pelo menos 1 outro. Com 2p, essa 1 outra pessoa é a única.)
+        const threshold = 1;
         const vote = {
           id: voteId,
           requesterId: clientId,
@@ -407,7 +412,7 @@ wss.on('connection', (ws, req) => {
           voteId,
           userName: clientName,
           requesterId: clientId,
-          totalOthers: room.clients.size - 1,
+          totalOthers: othersCount,
           threshold,
           expiresAt: vote.expiresAt,
         });
