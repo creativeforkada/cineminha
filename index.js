@@ -1,5 +1,5 @@
 // ============================================================
-// Cineminha — Servidor WebSocket v26.3.1
+// Cineminha — Servidor WebSocket v26.4.1
 // 🆕 v26.2.0.0: Relay de sinalização WebRTC para screen sharing
 // (host → guests em mesh P2P). Servidor NÃO trafega mídia.
 // ============================================================
@@ -358,6 +358,24 @@ wss.on('connection', (ws, req) => {
         room.state.playing = hostPlaying;
         room.state.updatedAt = Date.now();
         broadcast(room, { type: 'host_state', currentTime: hostTime, playing: hostPlaying, timestamp: Date.now() }, clientId);
+        break;
+      }
+      // 🆕 v26.4.1 — G1: Guest pede pausa. Apenas re-broadcasta o pedido;
+      // quem tá em posição de pausar (host ou qualquer um) recebe a msg
+      // e decide. Rate-limit simples: 1 pedido a cada 10s por cliente.
+      case 'pause_request': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        if (room.mode === 'broadcast') return;
+        const client = clients.get(ws);
+        if (!client) return;
+        const now = Date.now();
+        if (client.lastPauseReqAt && now - client.lastPauseReqAt < 10000) return;
+        client.lastPauseReqAt = now;
+        broadcast(room, {
+          type: 'pause_request',
+          userName: clientName,
+        }, clientId);
         break;
       }
       case 'chat': {
@@ -726,7 +744,7 @@ setInterval(() => {
 }, 5_000);
 
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v26.3.1 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v26.4.1 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
