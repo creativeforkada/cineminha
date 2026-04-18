@@ -307,7 +307,9 @@ wss.on('connection', (ws, req) => {
         room.state.currentTime = msg.currentTime || 0;
         room.state.playing = true;
         room.state.updatedAt = Date.now();
-        broadcast(room, { type: 'play', currentTime: msg.currentTime || 0, timestamp: Date.now() }, clientId);
+        // 🆕 v26.3.1 — Inclui hostName pro guest saber quem fez a ação
+        // na notificação "Host retomou em X".
+        broadcast(room, { type: 'play', currentTime: msg.currentTime || 0, timestamp: Date.now(), hostName: clientName }, clientId);
         break;
       }
       case 'pause': {
@@ -317,7 +319,7 @@ wss.on('connection', (ws, req) => {
         room.state.currentTime = msg.currentTime || 0;
         room.state.playing = false;
         room.state.updatedAt = Date.now();
-        broadcast(room, { type: 'pause', currentTime: msg.currentTime || 0 }, clientId);
+        broadcast(room, { type: 'pause', currentTime: msg.currentTime || 0, hostName: clientName }, clientId);
         break;
       }
       case 'seek': {
@@ -326,7 +328,25 @@ wss.on('connection', (ws, req) => {
         if (room.mode === 'broadcast') return; // 🆕 v26.3.0.0 — sync off
         room.state.currentTime = msg.currentTime || 0;
         room.state.updatedAt = Date.now();
-        broadcast(room, { type: 'seek', currentTime: msg.currentTime || 0 }, clientId);
+        broadcast(room, { type: 'seek', currentTime: msg.currentTime || 0, hostName: clientName }, clientId);
+        break;
+      }
+      // 🆕 v26.3.1 — Guest (não-host) fez play/pause/seek. Re-broadcasta
+      // como notificação pros outros (incluindo host). NÃO atualiza
+      // room.state — só o host é fonte de verdade.
+      case 'guest_event': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        if (room.hostId === clientId) return; // host usa video_event normal
+        if (room.mode === 'broadcast') return;
+        const action = msg.action;
+        if (action !== 'play' && action !== 'pause' && action !== 'seek') return;
+        broadcast(room, {
+          type: 'guest_event',
+          action,
+          currentTime: msg.currentTime || 0,
+          userName: clientName,
+        }, clientId);
         break;
       }
       case 'host_state': {
@@ -684,8 +704,29 @@ setInterval(() => {
   });
 }, 60_000);
 
+// 🆕 v26.3.1 — Broadcast periódico de host_state pros guests.
+// Mantém a referência de tempo do host atualizada no HUD mesmo sem
+// ações (play/pause/seek). Frequência: 5s.
+// Só dispara se:
+//   - sala em modo cinema (broadcast screen-share não usa sync)
+//   - sala tem host online (hostOrphanedAt null)
+//   - sala tem mais de 1 participante (só faz sentido com guests)
+setInterval(() => {
+  for (const room of rooms.values()) {
+    if (room.mode !== 'cinema') continue;
+    if (room.hostOrphanedAt) continue;
+    if (!room.hostId) continue;
+    if (room.clients.size < 2) continue;
+    const hostClient = room.clients.get(room.hostId);
+    if (!hostClient || !hostClient.ws || hostClient.ws.readyState !== 1) continue;
+    // Pede ao host pra enviar state atual.
+    // O host responderá com 'host_state' que chega pelos canais normais.
+    try { hostClient.ws.send(JSON.stringify({ type: 'request_host_state' })); } catch {}
+  }
+}, 5_000);
+
 server.listen(PORT, () => {
-  console.log(`\n🎬 Cineminha Server v26.2.0 rodando na porta ${PORT}`);
+  console.log(`\n🎬 Cineminha Server v26.3.1 rodando na porta ${PORT}`);
   console.log(`   HTTP: http://localhost:${PORT}`);
   console.log(`   WebSocket: ws://localhost:${PORT}\n`);
 });
