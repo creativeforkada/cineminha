@@ -245,6 +245,15 @@ wss.on('connection', (ws, req) => {
             type: 'user_joined', clientId, name: clientName,
             participants: getParticipantsList(room),
           }, clientId);
+          // 🆕 v26.3.1 — Quando um guest entra, pede ao host pra enviar
+          // o estado atual do player (currentTime, playing). Antes, o guest
+          // recebia room.state que só atualiza quando o host faz play/pause/seek;
+          // se o host já estava assistindo antes de criar a sala (ex: na metade
+          // de um filme), o guest via currentTime=0 e tentava começar do zero.
+          const hostClient = room.hostId ? room.clients.get(room.hostId) : null;
+          if (hostClient && hostClient.ws && hostClient.ws.readyState === 1) {
+            sendTo(hostClient.ws, { type: 'request_host_state' });
+          }
         }
         break;
       }
