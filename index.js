@@ -296,6 +296,7 @@ wss.on('connection', (ws, req) => {
         if (!room || room.hostId !== clientId) return;
         broadcast(room, { type: 'room_closed', reason: msg.reason || 'Host encerrou a sala.' });
         if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
+        if (room.activePauseVote?.timer) clearTimeout(room.activePauseVote.timer);
         rooms.delete(currentRoomId);
         currentRoomId = null;
         break;
@@ -360,22 +361,105 @@ wss.on('connection', (ws, req) => {
         broadcast(room, { type: 'host_state', currentTime: hostTime, playing: hostPlaying, timestamp: Date.now() }, clientId);
         break;
       }
-      // 🆕 v26.4.1 — G1: Guest pede pausa. Apenas re-broadcasta o pedido;
-      // quem tá em posição de pausar (host ou qualquer um) recebe a msg
-      // e decide. Rate-limit simples: 1 pedido a cada 10s por cliente.
+      // 🆕 v26.4.1 — G1: Sistema de votação pra pausar.
+      // Regras (maioria simples = solicitante + ≥1 de outros):
+      //   - Solicitante conta automaticamente como "sim"
+      //   - Precisa de pelo menos 1 voto de outro participante pra aprovar
+      //   - Timeout de 15s; se não atingir quorum, expira silenciosamente
+      //   - Rate-limit: 1 pedido a cada 10s por cliente
+      //   - Se só tem 1 pessoa na sala, pedido não é aceito (deve pausar sozinho)
       case 'pause_request': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
         if (room.mode === 'broadcast') return;
+        if (room.clients.size < 2) return;
         const client = clients.get(ws);
         if (!client) return;
         const now = Date.now();
         if (client.lastPauseReqAt && now - client.lastPauseReqAt < 10000) return;
+        if (room.activePauseVote) return; // já tem votação rolando
         client.lastPauseReqAt = now;
+
+        const voteId = `v_${now}_${Math.random().toString(36).slice(2, 8)}`;
+        const threshold = 1; // +1 além do solicitante (maioria simples)
+        const vote = {
+          id: voteId,
+          requesterId: clientId,
+          requesterName: clientName,
+          ayes: new Set([clientId]),
+          nays: new Set(),
+          threshold,
+          expiresAt: now + 15000,
+          timer: null,
+        };
+        room.activePauseVote = vote;
+
+        // Timer de expiração (15s)
+        vote.timer = setTimeout(() => {
+          if (room.activePauseVote && room.activePauseVote.id === voteId) {
+            broadcast(room, { type: 'pause_result', voteId, approved: false, reason: 'timeout' });
+            room.activePauseVote = null;
+          }
+        }, 15000);
+
         broadcast(room, {
           type: 'pause_request',
+          voteId,
           userName: clientName,
-        }, clientId);
+          requesterId: clientId,
+          totalOthers: room.clients.size - 1,
+          threshold,
+          expiresAt: vote.expiresAt,
+        });
+        break;
+      }
+      // 🆕 v26.4.1 — G1: Voto (aye=aprovar, nay=recusar)
+      case 'pause_vote': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.activePauseVote) return;
+        const vote = room.activePauseVote;
+        if (msg.voteId && msg.voteId !== vote.id) return;
+        if (clientId === vote.requesterId) return; // solicitante não vota de novo
+        if (vote.ayes.has(clientId) || vote.nays.has(clientId)) return;
+
+        if (msg.approve) vote.ayes.add(clientId);
+        else vote.nays.add(clientId);
+
+        // Broadcast progresso atual
+        broadcast(room, {
+          type: 'pause_vote_progress',
+          voteId: vote.id,
+          ayes: vote.ayes.size,
+          nays: vote.nays.size,
+          totalOthers: room.clients.size - 1,
+          threshold: vote.threshold,
+        });
+
+        // Aprovou? Precisa de solicitante + threshold "ayes" dos outros
+        // vote.ayes inclui o solicitante; outros = ayes.size - 1
+        const othersAyes = vote.ayes.size - 1;
+        if (othersAyes >= vote.threshold) {
+          clearTimeout(vote.timer);
+          broadcast(room, { type: 'pause_result', voteId: vote.id, approved: true });
+          room.activePauseVote = null;
+        }
+        // Recusado por maioria? Se todos os outros recusaram, cancela
+        else if (vote.nays.size >= (room.clients.size - 1)) {
+          clearTimeout(vote.timer);
+          broadcast(room, { type: 'pause_result', voteId: vote.id, approved: false, reason: 'rejected' });
+          room.activePauseVote = null;
+        }
+        break;
+      }
+      // 🆕 v26.4.1 — G1: Solicitante cancela antes do fim
+      case 'pause_cancel': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.activePauseVote) return;
+        const vote = room.activePauseVote;
+        if (clientId !== vote.requesterId) return;
+        clearTimeout(vote.timer);
+        broadcast(room, { type: 'pause_result', voteId: vote.id, approved: false, reason: 'cancelled' });
+        room.activePauseVote = null;
         break;
       }
       case 'chat': {
