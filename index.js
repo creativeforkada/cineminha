@@ -374,7 +374,10 @@ wss.on('connection', (ws, req) => {
         if (!room) return;
         if (room.mode === 'broadcast') return;
         if (room.clients.size < 2) return;
-        const client = clients.get(ws);
+        // 🔧 v26.4.2 — Bug fix: usava `clients.get(ws)` referenciando um
+        // mapa global inexistente (TypeError silencioso matava a votação).
+        // Agora pega o registro do próprio cliente via `room.clients.get(clientId)`.
+        const client = room.clients.get(clientId);
         if (!client) return;
         const now = Date.now();
         if (client.lastPauseReqAt && now - client.lastPauseReqAt < 10000) return;
