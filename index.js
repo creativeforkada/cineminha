@@ -109,6 +109,15 @@ function isMigrating(room) {
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
+  // 🆕 v26.4.1 — /ping: endpoint leve pra o cliente detectar se o servidor
+  // está acordado. No Render free tier o servidor hiberna após 15min
+  // ociosos; o primeiro request pode levar 30-60s pra acordar. O sidepanel
+  // faz um fetch silencioso quando abre pra dar feedback visual nesse caso.
+  if (req.method === 'GET' && req.url === '/ping') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
   const roomMatch = req.url.match(/^\/room\/([a-f0-9]{6,12})$/);
   if (req.method === 'GET' && roomMatch) {
     const room = rooms.get(roomMatch[1]);
@@ -159,7 +168,18 @@ wss.on('connection', (ws, req) => {
   let clientName = 'Anônimo';
 
   ws.on('message', (rawData) => {
-    if (!tryConsume()) return;
+    if (!tryConsume()) {
+      // 🆕 v-next — C1: Avisa o cliente só pra tipos de usuário (chat, reaction).
+      // Tipos internos de sync/typing não precisam de feedback — dropam silenciosamente
+      // pra não congestionar ainda mais quando o cliente está spammando.
+      try {
+        const msg = JSON.parse(rawData);
+        if (msg && (msg.type === 'chat' || msg.type === 'reaction')) {
+          sendTo(ws, { type: 'rate_limited', originalType: msg.type });
+        }
+      } catch {}
+      return;
+    }
     let msg;
     try { msg = JSON.parse(rawData); } catch { return; }
     if (!msg || !msg.type) return;
@@ -374,7 +394,7 @@ wss.on('connection', (ws, req) => {
         if (!room) return;
         if (room.mode === 'broadcast') return;
         if (room.clients.size < 2) return;
-        // 🔧 v26.4.2 — Bug fix: usava `clients.get(ws)` referenciando um
+        // 🔧 v26.4.1 — Bug fix: usava `clients.get(ws)` referenciando um
         // mapa global inexistente (TypeError silencioso matava a votação).
         // Agora pega o registro do próprio cliente via `room.clients.get(clientId)`.
         const client = room.clients.get(clientId);
@@ -487,12 +507,39 @@ wss.on('connection', (ws, req) => {
           const rText = typeof msg.replyTo.text === 'string' ? msg.replyTo.text.slice(0, 200) : '';
           if (rName && rText) replyTo = { name: rName, text: rText };
         }
+        // 🆕 v-next — Menções: array de strings (nomes de participantes)
+        // ou o literal "__all__" para @todos. Limite de 20 menções/mensagem
+        // e cada nome cap 40 chars pra evitar abuso.
+        let mentions = null;
+        if (Array.isArray(msg.mentions)) {
+          const cleaned = msg.mentions
+            .filter(m => typeof m === 'string')
+            .map(m => m.slice(0, 40))
+            .slice(0, 20);
+          if (cleaned.length) mentions = cleaned;
+        }
+        // 🆕 v-next — msgId: identifica mensagem pra reações (C3) e edição/exclusão (C5).
+        // 12 chars é suficiente pra evitar colisão em salas de chat.
+        const msgId = crypto.randomBytes(6).toString('hex');
+        // Guarda metadados mínimos da mensagem na sala pra validar ops subsequentes.
+        // TTL implícito: sala toda some quando esvazia. Limitamos a 500 mensagens
+        // pra evitar crescimento infinito em salas de longa duração.
+        if (!room.messages) room.messages = new Map();
+        room.messages.set(msgId, {
+          clientId, text, ts: Date.now(), reactions: new Map(), // Map<emoji, Set<clientId>>
+          edited: false, deleted: false,
+        });
+        if (room.messages.size > 500) {
+          const oldestKey = room.messages.keys().next().value;
+          room.messages.delete(oldestKey);
+        }
         broadcast(room, {
           type: 'chat', clientId, name: clientName,
           avatar: sender?.avatar || '😎',
           nameColor: sender?.nameColor || '#f0f0f5',
-          message: text, ts: Date.now(),
+          message: text, ts: Date.now(), msgId,
           ...(replyTo ? { replyTo } : {}),
+          ...(mentions ? { mentions } : {}),
         });
         break;
       }
@@ -504,13 +551,134 @@ wss.on('connection', (ws, req) => {
         broadcast(room, { type: 'reaction', name: clientName, emoji: msg.emoji, senderId: clientId });
         break;
       }
-      // 🆕 v26.3.1.0 — Indicador "está digitando". Broadcast efêmero,
+      // 🆕 v-next — Indicador "está digitando". Broadcast efêmero,
       // sem persistência. Clientes expiram localmente após ~3s sem update.
+      // 🆕 v-next — Inclui avatar pro C2 (stack visual de avatares)
       case 'typing': {
         const room = rooms.get(currentRoomId);
         if (!room) return;
         if (room.mutedUsers && room.mutedUsers.has(clientId)) return;
-        broadcast(room, { type: 'typing', name: clientName, senderId: clientId, active: !!msg.active }, clientId);
+        const sender = room.clients.get(clientId);
+        broadcast(room, {
+          type: 'typing', name: clientName, senderId: clientId,
+          avatar: sender?.avatar || '😎',
+          active: !!msg.active,
+        }, clientId);
+        break;
+      }
+
+      // 🆕 v-next — C3: Reação a mensagem específica (toggle).
+      // Cliente manda { type: 'msg_react', msgId, emoji }. Server
+      // broadcasta estado completo das reações daquela mensagem.
+      case 'msg_react': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.messages) return;
+        if (room.mutedUsers.has(clientId)) return;
+        const allowed = ['❤️', '😂', '😮', '😢', '🔥', '👏', '🍿', '👀'];
+        if (!allowed.includes(msg.emoji)) return;
+        const m = room.messages.get(msg.msgId);
+        if (!m || m.deleted) return;
+        let set = m.reactions.get(msg.emoji);
+        if (!set) { set = new Set(); m.reactions.set(msg.emoji, set); }
+        if (set.has(clientId)) set.delete(clientId);
+        else set.add(clientId);
+        if (set.size === 0) m.reactions.delete(msg.emoji);
+        // Monta snapshot serializável: { emoji: [clientId, ...], ... }
+        const snapshot = {};
+        m.reactions.forEach((s, emo) => { snapshot[emo] = Array.from(s); });
+        broadcast(room, { type: 'msg_react_update', msgId: msg.msgId, reactions: snapshot });
+        break;
+      }
+
+      // 🆕 v-next — C5: Edição (janela de 30s, só autor).
+      case 'msg_edit': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.messages) return;
+        if (room.mutedUsers.has(clientId)) return;
+        const m = room.messages.get(msg.msgId);
+        if (!m || m.deleted) return;
+        if (m.clientId !== clientId) return; // só autor
+        if (Date.now() - m.ts > 30000) return; // fora da janela
+        const newText = sanitizeText(msg.message);
+        if (!newText) return;
+        m.text = newText;
+        m.edited = true;
+        broadcast(room, { type: 'msg_edit_update', msgId: msg.msgId, message: newText });
+        break;
+      }
+
+      // 🆕 v-next — C5: Exclusão (janela de 30s, autor OU host).
+      case 'msg_delete': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.messages) return;
+        const m = room.messages.get(msg.msgId);
+        if (!m || m.deleted) return;
+        const isAuthor = m.clientId === clientId;
+        const isHost = room.hostId === clientId;
+        if (!isAuthor && !isHost) return;
+        // Autor tem janela de 30s; host pode a qualquer tempo
+        if (isAuthor && !isHost && Date.now() - m.ts > 30000) return;
+        m.deleted = true;
+        m.text = '';
+        m.reactions.clear();
+        broadcast(room, { type: 'msg_delete_update', msgId: msg.msgId });
+        break;
+      }
+
+      // 🆕 v-next — D3: Poll (enquete inline no chat).
+      // Cliente (qualquer) cria poll; todos votam; fechamento automático em 30s.
+      case 'poll_create': {
+        const room = rooms.get(currentRoomId);
+        if (!room) return;
+        if (room.mutedUsers.has(clientId)) return;
+        const question = sanitizeText(msg.question);
+        if (!question) return;
+        if (!Array.isArray(msg.options)) return;
+        const options = msg.options.slice(0, 4).map(o => sanitizeText(o)).filter(Boolean);
+        if (options.length < 2) return;
+        if (!room.polls) room.polls = new Map();
+        // Só 1 poll ativo por vez — se existir, rejeita silenciosamente
+        if (Array.from(room.polls.values()).some(p => !p.closed)) return;
+        const pollId = crypto.randomBytes(6).toString('hex');
+        const poll = {
+          pollId, question, options,
+          votes: new Map(), // Map<clientId, optionIdx>
+          creatorId: clientId,
+          creatorName: clientName,
+          startedAt: Date.now(),
+          durationMs: 30000,
+          closed: false,
+        };
+        room.polls.set(pollId, poll);
+        broadcast(room, {
+          type: 'poll_open', pollId, question, options,
+          creatorName: clientName, durationMs: poll.durationMs,
+        });
+        // Fechamento automático
+        setTimeout(() => {
+          const p = room.polls.get(pollId);
+          if (!p || p.closed) return;
+          p.closed = true;
+          const tally = p.options.map(() => 0);
+          p.votes.forEach(idx => { if (idx >= 0 && idx < tally.length) tally[idx]++; });
+          broadcast(room, { type: 'poll_close', pollId, tally });
+        }, poll.durationMs);
+        break;
+      }
+
+      // 🆕 v-next — D3: Voto em poll ativa.
+      case 'poll_vote': {
+        const room = rooms.get(currentRoomId);
+        if (!room || !room.polls) return;
+        const p = room.polls.get(msg.pollId);
+        if (!p || p.closed) return;
+        const idx = Number(msg.optionIdx);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= p.options.length) return;
+        p.votes.set(clientId, idx);
+        // Broadcast tally parcial pra todos verem em tempo real
+        const tally = p.options.map(() => 0);
+        p.votes.forEach(v => { if (v >= 0 && v < tally.length) tally[v]++; });
+        broadcast(room, { type: 'poll_update', pollId: msg.pollId, tally });
         break;
       }
       case 'kick_user': {
