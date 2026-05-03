@@ -914,14 +914,8 @@ wss.on('connection', (ws, req) => {
     room.mutedUsers.delete(clientId);
     room.readiness.delete(clientId);
     if (room.hostId === clientId) {
-      // 🆕 v26.2.0.0 — Screen share do host cai junto com o host
-      if (room.screenShareActive) {
-        room.screenShareActive = false;
-        room.screenShareStartedAt = null;
-        room.screenShareHasAudio = false;
-        broadcast(room, { type: 'screenshare_stopped', hostId: clientId, reason: 'host_left' });
-      }
       if (room.clients.size === 0) {
+        if (room.hostOrphanTimer) clearTimeout(room.hostOrphanTimer);
         rooms.delete(currentRoomId);
       } else {
         room.hostOrphanedAt = Date.now();
@@ -936,6 +930,12 @@ wss.on('connection', (ws, req) => {
           });
           if (!newHostId) { rooms.delete(room.id); return; }
           const newHost = room.clients.get(newHostId);
+          if (room.screenShareActive) {
+            room.screenShareActive = false;
+            room.screenShareStartedAt = null;
+            room.screenShareHasAudio = false;
+            broadcast(room, { type: 'screenshare_stopped', hostId: clientId, reason: 'host_left' });
+          }
           room.hostId = newHostId;
           room.hostToken = generateHostToken();
           room.hostOrphanedAt = null;
